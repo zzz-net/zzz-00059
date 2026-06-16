@@ -207,6 +207,22 @@ def execute_import_batch(batch_id, operator):
             db.session.add(app)
             db.session.flush()
 
+            final_conflict = check_pending_conflict(
+                record.venue_id, record.apply_date,
+                record.start_time, record.end_time,
+                exclude_app_id=app.id
+            )
+            if final_conflict:
+                db.session.rollback()
+                status_text = '已确认' if final_conflict.status == ApplicationStatus.CONFIRMED else '待审批'
+                final_err = f'写入前兜底检测：与{status_text}申请 #{final_conflict.id}「{final_conflict.event_name}」时间重叠'
+                record.status = ImportRecordStatus.IMPORT_FAIL
+                record.error_message = final_err
+                failed_count += 1
+                failure_details.append(f'第{record.line_number}行：{final_err}')
+                db.session.commit()
+                continue
+
             add_status_history(app, None, ApplicationStatus.SUBMITTED,
                                operator=operator,
                                action='submit',
