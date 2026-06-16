@@ -9,8 +9,11 @@ from models import db, Venue, Application, ApplicationStatus, StatusHistory, Aud
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                                    'scheduling.db')
+_db_path = os.environ.get('TEST_DB') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scheduling.db')
+if _db_path.startswith('sqlite://'):
+    app.config['SQLALCHEMY_DATABASE_URI'] = _db_path
+else:
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + _db_path
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JSON_AS_ASCII'] = False
 
@@ -21,6 +24,28 @@ db.init_app(app)
 _db_initialized = False
 
 
+def _migrate_schema():
+    from sqlalchemy import text
+    try:
+        conn = db.engine.connect()
+        try:
+            rs = conn.execute(text("PRAGMA table_info(applications)"))
+            cols = {row[1] for row in rs.fetchall()}
+            missing = []
+            for c in ('precheck_result', 'conflict_summary', 'approval_conclusion',
+                      'last_precheck_at', 'last_precheck_by'):
+                if c not in cols:
+                    missing.append(c)
+            for c in missing:
+                col_type = 'DATETIME' if c.endswith('_at') else 'VARCHAR(200)' if c == 'approval_conclusion' else 'TEXT' if c == 'conflict_summary' else 'VARCHAR(30)' if c == 'precheck_result' else 'VARCHAR(100)'
+                conn.execute(text(f"ALTER TABLE applications ADD COLUMN {c} {col_type} DEFAULT ''"))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
 @app.before_request
 def ensure_db_initialized():
     global _db_initialized
@@ -28,6 +53,7 @@ def ensure_db_initialized():
         return
     with app.app_context():
         db.create_all()
+        _migrate_schema()
         init_seed_data()
     _db_initialized = True
 
@@ -143,6 +169,105 @@ def check_pending_conflict(venue_id, apply_date, start_t, end_t, exclude_app_id=
         if time_overlap(start_t, end_t, a.start_time, a.end_time):
             return a
     return None
+
+
+def _app_summary_dict(app):
+    return {
+        'id': app.id,
+        'event_name': app.event_name,
+        'applicant_name': app.applicant_name,
+        'apply_date': app.apply_date.isoformat() if app.apply_date else None,
+        'start_time': app.start_time.strftime('%H:%M') if app.start_time else None,
+        'end_time': app.end_time.strftime('%H:%M') if app.end_time else None,
+        'status': app.status,
+    }
+
+
+def build_precheck(application):
+    venue = application.venue
+    venue_id = application.venue_id
+    apply_date = application.apply_date
+    start_t = application.start_time
+    end_t = application.end_time
+
+    confirmed_query = Application.query.filter(
+        Application.venue_id == venue_id,
+        Application.apply_date == apply_date,
+        Application.status == ApplicationStatus.CONFIRMED,
+        Application.id != application.id
+    )
+    confirmed_all = confirmed_query.order_by(Application.start_time.asc()).all()
+    confirmed_conflicts = [a for a in confirmed_all
+                           if time_overlap(start_t, end_t, a.start_time, a.end_time)]
+
+    pending_query = Application.query.filter(
+        Application.venue_id == venue_id,
+        Application.apply_date == apply_date,
+        Application.status == ApplicationStatus.PENDING_APPROVAL,
+        Application.id != application.id
+    )
+    pending_all = pending_query.order_by(Application.start_time.asc()).all()
+    pending_conflicts = [a for a in pending_all
+                         if time_overlap(start_t, end_t, a.start_time, a.end_time)]
+
+    confirmed_count = confirmed_query.count()
+    quota_remaining = max(0, venue.daily_quota - confirmed_count)
+    quota_ok = confirmed_count < venue.daily_quota
+
+    issues = []
+    expected = 'pass'
+
+    if confirmed_conflicts:
+        issues.append('存在已确认时段冲突')
+        expected = 'conflict'
+    if pending_conflicts:
+        issues.append('存在待审批重叠项')
+        if expected == 'pass':
+            expected = 'warning'
+    if not quota_ok:
+        issues.append('当日配额已用尽')
+        if expected not in ('conflict',):
+            expected = 'quota_exceeded'
+
+    if application.status not in (ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED):
+        expected = 'not_applicable'
+        issues.append('当前申请状态不处于待审批')
+
+    conflict_summary_parts = []
+    if confirmed_conflicts:
+        names = '、'.join('#%d「%s」' % (a.id, a.event_name) for a in confirmed_conflicts[:3])
+        if len(confirmed_conflicts) > 3:
+            names += '等%d个' % len(confirmed_conflicts)
+        conflict_summary_parts.append('已确认冲突：' + names)
+    if pending_conflicts:
+        names = '、'.join('#%d「%s」' % (a.id, a.event_name) for a in pending_conflicts[:3])
+        if len(pending_conflicts) > 3:
+            names += '等%d个' % len(pending_conflicts)
+        conflict_summary_parts.append('待审批重叠：' + names)
+    if not quota_ok:
+        conflict_summary_parts.append('配额已满(%d/%d)' % (confirmed_count, venue.daily_quota))
+    conflict_summary = '；'.join(conflict_summary_parts)
+
+    return {
+        'application_id': application.id,
+        'venue_id': venue.id,
+        'venue_name': venue.name,
+        'apply_date': apply_date.isoformat(),
+        'start_time': start_t.strftime('%H:%M'),
+        'end_time': end_t.strftime('%H:%M'),
+        'status': application.status,
+        'confirmed_count': confirmed_count,
+        'daily_quota': venue.daily_quota,
+        'quota_remaining': quota_remaining,
+        'quota_ok': quota_ok,
+        'confirmed_conflicts': [_app_summary_dict(a) for a in confirmed_conflicts],
+        'pending_conflicts': [_app_summary_dict(a) for a in pending_conflicts],
+        'confirmed_same_day': [_app_summary_dict(a) for a in confirmed_all],
+        'pending_same_day': [_app_summary_dict(a) for a in pending_all],
+        'issues': issues,
+        'expected_result': expected,
+        'conflict_summary': conflict_summary,
+    }
 
 
 @app.route('/')
@@ -278,6 +403,7 @@ def list_applications():
     venue_id = request.args.get('venue_id', type=int)
     status = request.args.get('status')
     apply_date = request.args.get('apply_date')
+    viewer = request.args.get('viewer', '').strip()
 
     query = Application.query
     if venue_id:
@@ -288,7 +414,13 @@ def list_applications():
         query = query.filter_by(apply_date=parse_date_str(apply_date))
 
     apps = query.order_by(Application.id.desc()).all()
-    return jsonify([a.to_dict() for a in apps])
+    result = []
+    for a in apps:
+        d = a.to_dict()
+        if is_approver(viewer) and a.status in (ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED):
+            d['precheck'] = build_precheck(a)
+        result.append(d)
+    return jsonify(result)
 
 
 @app.route('/api/applications', methods=['POST'])
@@ -362,7 +494,44 @@ def get_application(app_id):
     app = Application.query.get(app_id)
     if not app:
         return jsonify({'error': '申请不存在'}), 404
-    return jsonify(app.to_dict(include_history=True))
+    data = app.to_dict(include_history=True)
+    viewer = request.args.get('viewer', '').strip()
+    if is_approver(viewer) and app.status in (ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED):
+        data['precheck'] = build_precheck(app)
+    return jsonify(data)
+
+
+@app.route('/api/applications/<int:app_id>/precheck', methods=['GET'])
+def precheck_application(app_id):
+    app = Application.query.get(app_id)
+    if not app:
+        return jsonify({'error': '申请不存在'}), 404
+
+    operator = request.args.get('operator', '').strip()
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'precheck_denied', 'application', app_id,
+                      '无权限执行预检被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
+    precheck = build_precheck(app)
+
+    app.precheck_result = precheck['expected_result']
+    app.conflict_summary = precheck['conflict_summary']
+    app.last_precheck_at = datetime.utcnow()
+    app.last_precheck_by = operator
+    db.session.commit()
+
+    detail_bits = [
+        '预检申请 #%d' % app_id,
+        '结论=%s' % precheck['expected_result'],
+    ]
+    if precheck['conflict_summary']:
+        detail_bits.append(precheck['conflict_summary'])
+    add_audit_log(operator, 'precheck_application', 'application', app_id,
+                  ' | '.join(detail_bits), request.remote_addr)
+
+    return jsonify(precheck)
 
 
 @app.route('/api/applications/<int:app_id>/approve', methods=['POST'])
@@ -383,8 +552,19 @@ def approve_application(app_id):
     if app.status not in [ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED]:
         return jsonify({'error': f'当前状态为 {app.status}，不能审批通过'}), 400
 
+    precheck = build_precheck(app)
+    app.precheck_result = precheck['expected_result']
+    app.conflict_summary = precheck['conflict_summary']
+    app.last_precheck_at = datetime.utcnow()
+    app.last_precheck_by = operator
+
     conflict_app = check_conflict(app.venue_id, app.apply_date, app.start_time, app.end_time, exclude_app_id=app.id)
     if conflict_app:
+        conclusion = '驳回-时段冲突：与申请 #%d「%s」重叠' % (conflict_app.id, conflict_app.event_name)
+        app.approval_conclusion = conclusion
+        db.session.commit()
+        add_audit_log(operator, 'approve_conflict', 'application', app.id,
+                      '审批前正式校验冲突 | %s' % conclusion, request.remote_addr)
         return jsonify({
             'error': f'时段冲突：与申请 #{conflict_app.id}「{conflict_app.event_name}」时间重叠',
             'conflict_with': {
@@ -397,6 +577,11 @@ def approve_application(app_id):
 
     quota_ok, current_count = check_daily_quota(app.venue, app.apply_date, exclude_app_id=app.id)
     if not quota_ok:
+        conclusion = '驳回-配额已满（已确认%d场/配额%d场）' % (current_count, app.venue.daily_quota)
+        app.approval_conclusion = conclusion
+        db.session.commit()
+        add_audit_log(operator, 'approve_quota_fail', 'application', app.id,
+                      '审批前正式校验配额 | %s' % conclusion, request.remote_addr)
         return jsonify({
             'error': f'超出当日配额（已确认 {current_count} 场，配额 {app.venue.daily_quota} 场）'
         }), 409
@@ -407,6 +592,7 @@ def approve_application(app_id):
     app.approval_comment = data.get('comment', '')
     app.approved_by = operator
     app.approved_at = datetime.utcnow()
+    app.approval_conclusion = '审批通过：%s' % data.get('comment', '') if data.get('comment', '') else '审批通过'
 
     add_status_history(app, from_status, ApplicationStatus.CONFIRMED,
                        operator=operator,
@@ -415,8 +601,11 @@ def approve_application(app_id):
 
     db.session.commit()
 
+    audit_detail = '审批通过申请 #%d: %s' % (app.id, app.event_name)
+    if precheck['conflict_summary']:
+        audit_detail += ' | 预检摘要=' + precheck['conflict_summary']
     add_audit_log(operator, 'approve_application', 'application', app.id,
-                  f'审批通过申请 #{app.id}: {app.event_name}', request.remote_addr)
+                  audit_detail, request.remote_addr)
 
     return jsonify(app.to_dict(include_history=True))
 
@@ -440,12 +629,19 @@ def reject_application(app_id):
     if app.status not in [ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED]:
         return jsonify({'error': f'当前状态为 {app.status}，不能驳回'}), 400
 
+    precheck = build_precheck(app)
+    app.precheck_result = precheck['expected_result']
+    app.conflict_summary = precheck['conflict_summary']
+    app.last_precheck_at = datetime.utcnow()
+    app.last_precheck_by = operator
+
     from_status = app.status
     app.status = ApplicationStatus.REJECTED
     app.previous_status = from_status
     app.approval_comment = reason
     app.approved_by = operator
     app.approved_at = datetime.utcnow()
+    app.approval_conclusion = '审批驳回：%s' % reason if reason else '审批驳回'
 
     add_status_history(app, from_status, ApplicationStatus.REJECTED,
                        operator=operator,
@@ -454,8 +650,11 @@ def reject_application(app_id):
 
     db.session.commit()
 
+    audit_detail = '驳回申请 #%d: %s, 原因: %s' % (app.id, app.event_name, reason)
+    if precheck['conflict_summary']:
+        audit_detail += ' | 预检摘要=' + precheck['conflict_summary']
     add_audit_log(operator, 'reject_application', 'application', app.id,
-                  f'驳回申请 #{app.id}: {app.event_name}, 原因: {reason}', request.remote_addr)
+                  audit_detail, request.remote_addr)
 
     return jsonify(app.to_dict(include_history=True))
 
@@ -581,6 +780,15 @@ def get_schedule(date_str):
     return jsonify({'date': d.isoformat(), 'venues': result})
 
 
+STATUS_EXPORT_LABEL = {
+    ApplicationStatus.SUBMITTED: '已提交',
+    ApplicationStatus.PENDING_APPROVAL: '待审批',
+    ApplicationStatus.CONFIRMED: '已确认',
+    ApplicationStatus.CANCELLED: '已取消',
+    ApplicationStatus.REJECTED: '已驳回',
+}
+
+
 @app.route('/api/schedule/<date_str>/export', methods=['GET'])
 def export_schedule(date_str):
     try:
@@ -592,13 +800,15 @@ def export_schedule(date_str):
 
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(['日期', '场地', '活动名称', '申请人', '开始时间', '结束时间', '参与人数', '状态', '审批人', '审批意见'])
+    writer.writerow([
+        '日期', '场地', '活动名称', '申请人', '开始时间', '结束时间',
+        '参与人数', '状态', '审批人', '审批意见', '冲突摘要', '审批结论'
+    ])
 
     for v in venues:
         apps = Application.query.filter(
             Application.venue_id == v.id,
             Application.apply_date == d,
-            Application.status == ApplicationStatus.CONFIRMED
         ).order_by(Application.start_time.asc()).all()
 
         for a in apps:
@@ -610,16 +820,18 @@ def export_schedule(date_str):
                 a.start_time.strftime('%H:%M'),
                 a.end_time.strftime('%H:%M'),
                 a.participants,
-                '已确认',
-                a.approved_by,
-                a.approval_comment
+                STATUS_EXPORT_LABEL.get(a.status, a.status),
+                a.approved_by or '',
+                a.approval_comment or '',
+                a.conflict_summary or '',
+                a.approval_conclusion or '',
             ])
 
     csv_content = output.getvalue()
     output.close()
 
     add_audit_log(request.args.get('operator', 'anonymous'), 'export_schedule', 'schedule', None,
-                  f'导出 {d.isoformat()} 排期表', request.remote_addr)
+                  f'导出 {d.isoformat()} 排期表（含冲突摘要与审批结论）', request.remote_addr)
 
     return Response(
         csv_content,

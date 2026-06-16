@@ -670,6 +670,120 @@ form {
     padding-top: 12px;
 }
 
+.precheck-badge {
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+    margin-left: 6px;
+}
+
+.precheck-badge-lg {
+    padding: 4px 12px;
+    font-size: 13px;
+    margin-left: 8px;
+}
+
+.precheck-pass {
+    background: #d1fae5;
+    color: #065f46;
+}
+
+.precheck-warning {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.precheck-danger {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.precheck-block {
+    margin-top: 14px;
+    background: #f9fafb;
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+.precheck-block-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #374151;
+    margin-bottom: 8px;
+}
+
+.precheck-block-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.precheck-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: #fff;
+}
+
+.precheck-conflict-row {
+    background: #fef2f2;
+}
+
+.precheck-time {
+    color: #1e40af;
+    font-weight: 600;
+    font-size: 12px;
+    min-width: 90px;
+}
+
+.conflict-link {
+    color: #1e40af;
+    text-decoration: none;
+    cursor: pointer;
+    flex: 1;
+}
+
+.conflict-link:hover {
+    text-decoration: underline;
+}
+
+.precheck-tag {
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.precheck-tag-danger {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.precheck-tag-warning {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.precheck-note {
+    margin-top: 14px;
+    padding: 10px 12px;
+    background: #fff7ed;
+    color: #92400e;
+    border-radius: 6px;
+    font-size: 13px;
+    border-left: 3px solid #d97706;
+}
+
+.precheck-note-ok {
+    background: #ecfdf5;
+    color: #065f46;
+    border-left-color: #059669;
+}
+
 @media (max-width: 768px) {
     .app { padding: 10px; }
     .header { flex-direction: column; gap: 10px; align-items: flex-start; }
@@ -677,4 +791,5 @@ form {
     .app-item { flex-direction: column; align-items: flex-start; }
     .form-row { flex-direction: column; gap: 0; }
     .detail-grid { grid-template-columns: 1fr; }
+    .precheck-row { flex-wrap: wrap; }
 }

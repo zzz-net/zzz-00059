@@ -11,6 +11,14 @@ const STATUS_MAP = {
     'rejected': '已驳回'
 };
 
+const PRECHECK_LABEL = {
+    'pass': { text: '预检：预计可通过', cls: 'precheck-pass' },
+    'warning': { text: '预检：有待审批重叠', cls: 'precheck-warning' },
+    'conflict': { text: '预检：存在已确认冲突', cls: 'precheck-danger' },
+    'quota_exceeded': { text: '预检：配额已满', cls: 'precheck-danger' },
+    'not_applicable': { text: '', cls: '' }
+};
+
 const ACTION_MAP = {
     'submit': '提交申请',
     'auto_route': '系统流转',
@@ -192,7 +200,11 @@ function deleteVenue(id) {
 function loadApplications() {
     const status = document.getElementById('filterStatus').value;
     let url = '/applications';
-    if (status) url += '?status=' + status;
+    const params = [];
+    if (status) params.push('status=' + encodeURIComponent(status));
+    const op = getOperator();
+    if (op) params.push('viewer=' + encodeURIComponent(op));
+    if (params.length) url += '?' + params.join('&');
 
     apiGet(url).then(apps => {
         const container = document.getElementById('applicationList');
@@ -204,6 +216,13 @@ function loadApplications() {
     }).catch(err => alert(err.message));
 }
 
+function renderPrecheckBadge(a) {
+    if (!a.precheck) return '';
+    const info = PRECHECK_LABEL[a.precheck.expected_result];
+    if (!info || !info.text) return '';
+    return `<span class="precheck-badge ${info.cls}">${info.text}</span>`;
+}
+
 function renderAppItem(a) {
     return `
         <div class="app-item">
@@ -211,6 +230,7 @@ function renderAppItem(a) {
                 <div class="title-row">
                     <h4>${escapeHtml(a.event_name)}</h4>
                     <span class="status-badge status-${a.status}">${STATUS_MAP[a.status] || a.status}</span>
+                    ${renderPrecheckBadge(a)}
                 </div>
                 <div class="subtitle">
                     <span>🏢 ${escapeHtml(a.venue_name)}</span>
@@ -293,7 +313,9 @@ function saveApplication(e) {
 }
 
 function showAppDetail(id) {
-    apiGet('/applications/' + id).then(app => {
+    const op = getOperator();
+    const url = '/applications/' + id + (op ? '?viewer=' + encodeURIComponent(op) : '');
+    apiGet(url).then(app => {
         const content = document.getElementById('detailContent');
         content.innerHTML = `
             <div class="detail-section">
@@ -311,12 +333,17 @@ function showAppDetail(id) {
                 </div>
             </div>
 
+            ${renderPrecheckPanel(app)}
+
             <div class="detail-section">
                 <h4>审批信息</h4>
                 <div class="detail-grid">
                     <div class="label">审批人</div><div class="value">${escapeHtml(app.approved_by || '-')}</div>
                     <div class="label">审批时间</div><div class="value">${app.approved_at ? new Date(app.approved_at).toLocaleString('zh-CN') : '-'}</div>
                     <div class="label">审批意见</div><div class="value">${escapeHtml(app.approval_comment || '-')}</div>
+                    <div class="label">审批结论</div><div class="value">${escapeHtml(app.approval_conclusion || '-')}</div>
+                    <div class="label">冲突摘要</div><div class="value">${escapeHtml(app.conflict_summary || '-')}</div>
+                    <div class="label">最近预检</div><div class="value">${app.last_precheck_at ? new Date(app.last_precheck_at).toLocaleString('zh-CN') + '（' + escapeHtml(app.last_precheck_by || '-') + '）' : '-'}</div>
                     <div class="label">取消原因</div><div class="value">${escapeHtml(app.cancel_reason || '-')}</div>
                     <div class="label">取消人</div><div class="value">${escapeHtml(app.cancelled_by || '-')}</div>
                 </div>
@@ -423,7 +450,9 @@ function revokeApp(id) {
 }
 
 function loadApprovalList() {
-    apiGet('/applications?status=pending_approval').then(apps => {
+    const op = getOperator();
+    const url = '/applications?status=pending_approval' + (op ? '&viewer=' + encodeURIComponent(op) : '');
+    apiGet(url).then(apps => {
         const container = document.getElementById('approvalList');
         if (apps.length === 0) {
             container.innerHTML = '<div class="empty-state">暂无待审批申请</div>';
@@ -431,6 +460,75 @@ function loadApprovalList() {
         }
         container.innerHTML = apps.map(a => renderAppItem(a)).join('');
     }).catch(err => alert(err.message));
+}
+
+function renderConflictLinks(list) {
+    if (!list || list.length === 0) return '<span style="color:#9ca3af;">无</span>';
+    return list.map(c => `
+        <a href="javascript:void(0)" class="conflict-link" onclick="showAppDetail(${c.id})">
+            #${c.id} ${escapeHtml(c.event_name)} (${c.start_time}-${c.end_time} · ${STATUS_MAP[c.status] || c.status})
+        </a>
+    `).join('<br>');
+}
+
+function renderPrecheckPanel(app) {
+    if (!app.precheck) return '';
+    const p = app.precheck;
+    const info = PRECHECK_LABEL[p.expected_result] || { text: '预检：未知', cls: '' };
+    const resultBadge = info.text ? `<span class="precheck-badge precheck-badge-lg ${info.cls}">${info.text}</span>` : '';
+
+    let warningNote = '';
+    if (p.expected_result !== 'pass' && p.expected_result !== 'not_applicable') {
+        warningNote = '<div class="precheck-note">⚠️ 预检仅为参考，正式审批会再次实时校验，结果以正式审批为准。</div>';
+    } else if (p.expected_result === 'pass') {
+        warningNote = '<div class="precheck-note precheck-note-ok">✅ 预检无冲突、配额充足，正式审批仍会实时复核。</div>';
+    }
+
+    return `
+        <div class="detail-section">
+            <h4>审批前预检 ${resultBadge}</h4>
+            <div class="detail-grid">
+                <div class="label">场地</div><div class="value">${escapeHtml(p.venue_name)}</div>
+                <div class="label">日期</div><div class="value">${p.apply_date}</div>
+                <div class="label">当日已确认</div><div class="value">${p.confirmed_count} / ${p.daily_quota} 场（剩余 ${p.quota_remaining} 场）</div>
+            </div>
+            <div class="precheck-block">
+                <div class="precheck-block-title">同场地已确认占用</div>
+                <div class="precheck-block-body">
+                    ${p.confirmed_same_day && p.confirmed_same_day.length
+                        ? p.confirmed_same_day.map(c => `
+                            <div class="precheck-row ${p.confirmed_conflicts && p.confirmed_conflicts.some(x => x.id === c.id) ? 'precheck-conflict-row' : ''}">
+                                <span class="precheck-time">${c.start_time}-${c.end_time}</span>
+                                <a href="javascript:void(0)" class="conflict-link" onclick="showAppDetail(${c.id})">
+                                    #${c.id} ${escapeHtml(c.event_name)}（${escapeHtml(c.applicant_name)}）
+                                </a>
+                                ${p.confirmed_conflicts && p.confirmed_conflicts.some(x => x.id === c.id)
+                                    ? '<span class="precheck-tag precheck-tag-danger">冲突</span>' : ''}
+                            </div>
+                        `).join('')
+                        : '<span style="color:#9ca3af;">当日暂无已确认占用</span>'}
+                </div>
+            </div>
+            <div class="precheck-block">
+                <div class="precheck-block-title">待审批重叠项</div>
+                <div class="precheck-block-body">
+                    ${p.pending_same_day && p.pending_same_day.length
+                        ? p.pending_same_day.map(c => `
+                            <div class="precheck-row ${p.pending_conflicts && p.pending_conflicts.some(x => x.id === c.id) ? 'precheck-conflict-row' : ''}">
+                                <span class="precheck-time">${c.start_time}-${c.end_time}</span>
+                                <a href="javascript:void(0)" class="conflict-link" onclick="showAppDetail(${c.id})">
+                                    #${c.id} ${escapeHtml(c.event_name)}（${escapeHtml(c.applicant_name)}）
+                                </a>
+                                ${p.pending_conflicts && p.pending_conflicts.some(x => x.id === c.id)
+                                    ? '<span class="precheck-tag precheck-tag-warning">重叠</span>' : ''}
+                            </div>
+                        `).join('')
+                        : '<span style="color:#9ca3af;">当日暂无其他待审批申请</span>'}
+                </div>
+            </div>
+            ${warningNote}
+        </div>
+    `;
 }
 
 function loadSchedule() {

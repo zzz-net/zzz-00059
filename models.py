@@ -73,6 +73,12 @@ class Application(db.Model):
     cancel_reason = db.Column(db.Text, default='')
     cancelled_by = db.Column(db.String(100), default='')
 
+    precheck_result = db.Column(db.String(30), default='')
+    conflict_summary = db.Column(db.Text, default='')
+    approval_conclusion = db.Column(db.String(200), default='')
+    last_precheck_at = db.Column(db.DateTime, default=None)
+    last_precheck_by = db.Column(db.String(100), default='')
+
     created_by = db.Column(db.String(100), default='')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -100,6 +106,11 @@ class Application(db.Model):
             'approved_at': self.approved_at.isoformat() if self.approved_at else None,
             'cancel_reason': self.cancel_reason,
             'cancelled_by': self.cancelled_by,
+            'precheck_result': self.precheck_result,
+            'conflict_summary': self.conflict_summary,
+            'approval_conclusion': self.approval_conclusion,
+            'last_precheck_at': self.last_precheck_at.isoformat() if self.last_precheck_at else None,
+            'last_precheck_by': self.last_precheck_by,
             'created_by': self.created_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
