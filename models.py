@@ -172,3 +172,107 @@ class AuditLog(db.Model):
             'ip_address': self.ip_address,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class ImportBatchStatus:
+    PREVIEW = 'preview'
+    CONFIRMED = 'confirmed'
+    COMPLETED = 'completed'
+    CANCELLED = 'cancelled'
+
+
+class ImportBatch(db.Model):
+    __tablename__ = 'import_batches'
+
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    status = db.Column(db.String(30), nullable=False, default=ImportBatchStatus.PREVIEW)
+    total_count = db.Column(db.Integer, default=0)
+    success_count = db.Column(db.Integer, default=0)
+    failed_count = db.Column(db.Integer, default=0)
+    preview_summary = db.Column(db.Text, default='')
+    failure_summary = db.Column(db.Text, default='')
+    created_by = db.Column(db.String(100), default='')
+    confirmed_by = db.Column(db.String(100), default='')
+    confirmed_at = db.Column(db.DateTime, default=None)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    records = db.relationship('ImportRecord', backref='batch', lazy=True,
+                              cascade='all, delete-orphan', order_by='ImportRecord.line_number')
+
+    def to_dict(self, include_records=False):
+        data = {
+            'id': self.id,
+            'filename': self.filename,
+            'status': self.status,
+            'total_count': self.total_count,
+            'success_count': self.success_count,
+            'failed_count': self.failed_count,
+            'preview_summary': self.preview_summary,
+            'failure_summary': self.failure_summary,
+            'created_by': self.created_by,
+            'confirmed_by': self.confirmed_by,
+            'confirmed_at': self.confirmed_at.isoformat() if self.confirmed_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_records:
+            data['records'] = [r.to_dict() for r in self.records]
+        return data
+
+
+class ImportRecordStatus:
+    PENDING = 'pending'
+    PREVIEW_PASS = 'preview_pass'
+    PREVIEW_FAIL = 'preview_fail'
+    IMPORT_SUCCESS = 'import_success'
+    IMPORT_FAIL = 'import_fail'
+    DUPLICATE_IN_BATCH = 'duplicate_in_batch'
+
+
+class ImportRecord(db.Model):
+    __tablename__ = 'import_records'
+
+    id = db.Column(db.Integer, primary_key=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey('import_batches.id'), nullable=False)
+    line_number = db.Column(db.Integer, nullable=False)
+
+    venue_name = db.Column(db.String(100), default='')
+    venue_id = db.Column(db.Integer, default=None)
+    event_name = db.Column(db.String(200), default='')
+    applicant_name = db.Column(db.String(100), default='')
+    apply_date = db.Column(db.Date, default=None)
+    start_time = db.Column(db.Time, default=None)
+    end_time = db.Column(db.Time, default=None)
+    participants = db.Column(db.Integer, default=0)
+
+    status = db.Column(db.String(30), nullable=False, default=ImportRecordStatus.PENDING)
+    error_message = db.Column(db.Text, default='')
+    application_id = db.Column(db.Integer, default=None)
+
+    raw_data = db.Column(db.Text, default='')
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'batch_id': self.batch_id,
+            'line_number': self.line_number,
+            'venue_name': self.venue_name,
+            'venue_id': self.venue_id,
+            'event_name': self.event_name,
+            'applicant_name': self.applicant_name,
+            'apply_date': self.apply_date.isoformat() if self.apply_date else None,
+            'start_time': self.start_time.strftime('%H:%M') if self.start_time else None,
+            'end_time': self.end_time.strftime('%H:%M') if self.end_time else None,
+            'participants': self.participants,
+            'status': self.status,
+            'error_message': self.error_message,
+            'application_id': self.application_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }

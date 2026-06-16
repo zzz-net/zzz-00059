@@ -109,6 +109,36 @@ def _homepage():
             return r.read().decode('utf-8'), r.status
 
 
+def _post_multipart(path, fields, files):
+    from io import BytesIO
+    if TEST_MODE == 'direct':
+        c = _get_client()
+        data = {**fields}
+        for f in files:
+            data[f['name']] = (BytesIO(f['content']), f['filename'])
+        r = c.post(API + path, data=data, content_type='multipart/form-data')
+        try:
+            body = r.get_json(silent=True) or json.loads(r.data or '{}')
+        except Exception:
+            body = None
+        if 200 <= r.status_code < 300:
+            return body, None, r.status_code
+        err = None
+        if isinstance(body, dict):
+            err = body.get('error')
+        return None, err or ('HTTP %d' % r.status_code), r.status_code
+    else:
+        raise Exception('HTTP 模式下的 multipart 上传未实现，请使用 direct 模式')
+
+
+def _make_csv(rows):
+    header = ['场地名称', '活动名称', '申请人', '申请日期', '开始时间', '结束时间', '参与人数']
+    lines = [','.join(header)]
+    for row in rows:
+        lines.append(','.join(str(v) for v in row))
+    return '\n'.join(lines).encode('utf-8-sig')
+
+
 def safe_get(d, key, default=None):
     if d is None:
         return default
@@ -761,6 +791,400 @@ def test_precheck_full_link_zh_params():
           'header=%s' % csv_text.split('\n')[0][:150])
 
 
+def test_import_all_pass():
+    print('\n=== 14. 批量导入：预演全部通过，正式导入全部成功 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 30)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('导入测试-通过1'), '张三', test_date, '09:00', '10:00', '20'],
+        ['会议室B', unique_name('导入测试-通过2'), '李四', test_date, '10:00', '11:00', '10'],
+        ['活动室C', unique_name('导入测试-通过3'), '王五', test_date, '14:00', '15:00', '5'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, err, code = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'test_all_pass.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传CSV返回201', code == 201, 'status=%d err=%s' % (code, err))
+    batch_id = safe_get(result, 'id')
+    check('批次ID已返回', batch_id is not None, 'batch_id=%s' % batch_id)
+    if batch_id is None:
+        return
+
+    check('批次状态为 preview', safe_get(result, 'status') == 'preview',
+          'status=%s' % safe_get(result, 'status'))
+    check('总记录数=3', safe_get(result, 'total_count') == 3,
+          'total=%d' % safe_get(result, 'total_count'))
+
+    records = safe_get(result, 'records', [])
+    check('返回3条记录', len(records) == 3, 'count=%d' % len(records))
+
+    preview_pass = [r for r in records if safe_get(r, 'status') == 'preview_pass']
+    preview_fail = [r for r in records if safe_get(r, 'status') in ('preview_fail', 'duplicate_in_batch')]
+    check('预演全部通过（3条 preview_pass）', len(preview_pass) == 3 and len(preview_fail) == 0,
+          'pass=%d fail=%d' % (len(preview_pass), len(preview_fail)))
+
+    check('预演摘要正确',
+          '预演通过 3 条' in safe_get(result, 'preview_summary', ''),
+          'summary=%s' % safe_get(result, 'preview_summary'))
+
+    confirm_result, confirm_err, confirm_code = _post('/import/%d/confirm' % batch_id, {
+        'operator': '张三'
+    })
+    check('确认导入返回200', confirm_code == 200, 'status=%d err=%s' % (confirm_code, confirm_err))
+    check('导入后状态为 completed', safe_get(confirm_result, 'status') == 'completed',
+          'status=%s' % safe_get(confirm_result, 'status'))
+    check('成功3条失败0条',
+          safe_get(confirm_result, 'success_count') == 3 and safe_get(confirm_result, 'failed_count') == 0,
+          'success=%d failed=%d' % (safe_get(confirm_result, 'success_count'),
+                                    safe_get(confirm_result, 'failed_count')))
+
+    confirm_records = safe_get(confirm_result, 'records', [])
+    success_records = [r for r in confirm_records if safe_get(r, 'status') == 'import_success']
+    check('3条记录均为 import_success', len(success_records) == 3,
+          'success_count=%d' % len(success_records))
+
+    for r in success_records:
+        app_id = safe_get(r, 'application_id')
+        check('成功记录有 application_id', app_id is not None, 'app_id=%s' % app_id)
+        if app_id:
+            app_detail = _get('/applications/%d' % app_id)
+            check('导入的申请状态为 pending_approval',
+                  safe_get(app_detail, 'status') == 'pending_approval',
+                  'status=%s' % safe_get(app_detail, 'status'))
+            check('导入的申请 created_by 正确',
+                  safe_get(app_detail, 'created_by') == '张三',
+                  'created_by=%s' % safe_get(app_detail, 'created_by'))
+
+    list_batches = _get('/import?operator=张三')
+    check('导入列表可查询', isinstance(list_batches, list) and len(list_batches) >= 1,
+          'type=%s len=%d' % (type(list_batches), len(list_batches) if isinstance(list_batches, list) else 0))
+
+    batch_in_list = next((b for b in list_batches if safe_get(b, 'id') == batch_id), None)
+    check('批次在列表中', batch_in_list is not None, 'found=%s' % (batch_in_list is not None))
+
+    detail = _get('/import/%d?operator=张三' % batch_id)
+    check('批次详情可查询', safe_get(detail, 'id') == batch_id, 'id=%s' % safe_get(detail, 'id'))
+    check('详情包含记录', len(safe_get(detail, 'records', [])) == 3,
+          'records_count=%d' % len(safe_get(detail, 'records', [])))
+
+
+def test_import_partial_failure():
+    print('\n=== 15. 批量导入：部分失败，成功行入库，失败行保留原因 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 31)).isoformat()
+
+    existing_app, _, _ = _post('/applications', {
+        'venue_id': 1,
+        'event_name': unique_name('导入冲突基线'),
+        'applicant_name': '测试员',
+        'apply_date': test_date,
+        'start_time': '10:00',
+        'end_time': '11:00',
+    })
+    existing_id = safe_get(existing_app, 'id')
+    check('基线申请创建成功', existing_id is not None, 'id=%s' % existing_id)
+    if existing_id:
+        _post('/applications/%d/approve' % existing_id, {'operator': '张三'})
+
+    csv_rows = [
+        ['多功能厅A', unique_name('导入测试-成功'), '张三', test_date, '09:00', '10:00', '20'],
+        ['不存在的场地', unique_name('导入测试-场地不存在'), '李四', test_date, '10:00', '11:00', '10'],
+        ['会议室B', unique_name('导入测试-时间错'), '王五', test_date, '11:00', '10:00', '5'],
+        ['多功能厅A', unique_name('导入测试-冲突'), '赵六', test_date, '10:30', '11:30', '15'],
+        ['会议室B', unique_name('导入测试-超营业时间'), '钱七', test_date, '07:00', '08:00', '8'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, err, code = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'test_partial.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传CSV返回201', code == 201, 'status=%d err=%s' % (code, err))
+    batch_id = safe_get(result, 'id')
+    check('批次ID已返回', batch_id is not None, 'batch_id=%s' % batch_id)
+    if batch_id is None:
+        return
+
+    records = safe_get(result, 'records', [])
+    preview_pass = [r for r in records if safe_get(r, 'status') == 'preview_pass']
+    preview_fail = [r for r in records if safe_get(r, 'status') in ('preview_fail', 'duplicate_in_batch')]
+    check('预演：1条通过，4条失败', len(preview_pass) == 1 and len(preview_fail) == 4,
+          'pass=%d fail=%d' % (len(preview_pass), len(preview_fail)))
+
+    fail_messages = [safe_get(r, 'error_message', '') for r in preview_fail]
+    has_venue_error = any('不存在' in msg for msg in fail_messages)
+    has_time_order_error = any('开始时间必须早于结束时间' in msg for msg in fail_messages)
+    has_conflict_error = any('时段冲突' in msg for msg in fail_messages)
+    has_hours_error = any('营业时间' in msg for msg in fail_messages)
+    check('预演错误包含场地不存在', has_venue_error, 'msgs=%s' % fail_messages)
+    check('预演错误包含时间顺序错误', has_time_order_error, 'msgs=%s' % fail_messages)
+    check('预演错误包含时段冲突', has_conflict_error, 'msgs=%s' % fail_messages)
+    check('预演错误包含营业时间错误', has_hours_error, 'msgs=%s' % fail_messages)
+
+    confirm_result, confirm_err, confirm_code = _post('/import/%d/confirm' % batch_id, {
+        'operator': '张三'
+    })
+    check('确认导入返回200', confirm_code == 200, 'status=%d err=%s' % (confirm_code, confirm_err))
+    check('成功1条失败4条',
+          safe_get(confirm_result, 'success_count') == 1 and safe_get(confirm_result, 'failed_count') == 4,
+          'success=%d failed=%d' % (safe_get(confirm_result, 'success_count'),
+                                    safe_get(confirm_result, 'failed_count')))
+
+    confirm_records = safe_get(confirm_result, 'records', [])
+    success_recs = [r for r in confirm_records if safe_get(r, 'status') == 'import_success']
+    fail_recs = [r for r in confirm_records if safe_get(r, 'status') == 'import_fail']
+    check('1条 import_success', len(success_recs) == 1, 'success=%d' % len(success_recs))
+    check('4条 import_fail', len(fail_recs) == 4, 'fail=%d' % len(fail_recs))
+
+    for r in fail_recs:
+        check('失败记录保留错误信息', len(safe_get(r, 'error_message', '')) > 0,
+              'line=%d msg=%s' % (safe_get(r, 'line_number'), safe_get(r, 'error_message')))
+
+    failure_summary = safe_get(confirm_result, 'failure_summary', '')
+    check('批次 failure_summary 包含失败原因', len(failure_summary) > 0, 'summary=%s' % failure_summary)
+
+    success_app_id = safe_get(success_recs[0], 'application_id')
+    if success_app_id:
+        app_detail = _get('/applications/%d' % success_app_id)
+        check('成功导入的申请状态正确', safe_get(app_detail, 'status') == 'pending_approval',
+              'status=%s' % safe_get(app_detail, 'status'))
+
+
+def test_import_duplicate_in_batch():
+    print('\n=== 16. 批量导入：同一批文件内重复记录检测 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 32)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('导入重复-A'), '张三', test_date, '09:00', '10:00', '20'],
+        ['多功能厅A', unique_name('导入重复-B'), '李四', test_date, '09:00', '10:00', '10'],
+        ['会议室B', unique_name('导入正常'), '王五', test_date, '10:00', '11:00', '5'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, err, code = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'test_duplicate.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传CSV返回201', code == 201, 'status=%d err=%s' % (code, err))
+    batch_id = safe_get(result, 'id')
+    check('批次ID已返回', batch_id is not None, 'batch_id=%s' % batch_id)
+    if batch_id is None:
+        return
+
+    records = safe_get(result, 'records', [])
+    duplicates = [r for r in records if safe_get(r, 'status') == 'duplicate_in_batch']
+    normal_pass = [r for r in records if safe_get(r, 'status') == 'preview_pass']
+
+    check('检测到2条重复记录', len(duplicates) == 2, 'duplicates=%d' % len(duplicates))
+    check('1条正常通过', len(normal_pass) == 1, 'normal=%d' % len(normal_pass))
+
+    for r in duplicates:
+        check('重复记录有明确错误信息',
+              '重复' in safe_get(r, 'error_message', ''),
+              'msg=%s' % safe_get(r, 'error_message'))
+
+    confirm_result, _, confirm_code = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('确认导入成功', confirm_code == 200, 'status=%d' % confirm_code)
+    check('成功1条失败2条',
+          safe_get(confirm_result, 'success_count') == 1 and safe_get(confirm_result, 'failed_count') == 2,
+          'success=%d failed=%d' % (safe_get(confirm_result, 'success_count'),
+                                    safe_get(confirm_result, 'failed_count')))
+
+
+def test_import_permission_control():
+    print('\n=== 17. 批量导入：权限控制，普通申请人被拒绝 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 33)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('导入权限测试'), '李四', test_date, '09:00', '10:00', '20'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, err, code = _post_multipart('/import/upload',
+                                         {'operator': '李四'},
+                                         [{'name': 'file', 'filename': 'test_perm.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('普通申请人上传返回403', code == 403, 'status=%d err=%s' % (code, err))
+    check('错误提示需审批人权限', err and '审批人权限' in err, 'err=%s' % err)
+
+    list_body, list_code = _get_with_status('/import?operator=李四')
+    list_err = safe_get(list_body, 'error')
+    check('普通申请人查看列表返回403', list_code == 403, 'status=%d' % list_code)
+
+    view_body, view_code = _get_with_status('/import/1?operator=李四')
+    view_err = safe_get(view_body, 'error')
+    check('普通申请人查看详情返回403', view_code == 403, 'status=%d' % view_code)
+
+
+def test_import_logs_and_export():
+    print('\n=== 18. 批量导入：操作日志记录与导出可见 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 34)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('导入日志测试'), '张三', test_date, '09:00', '10:00', '20'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, err, code = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'test_log.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传成功', code == 201, 'status=%d err=%s' % (code, err))
+    batch_id = safe_get(result, 'id')
+    if batch_id is None:
+        return
+
+    confirm_result, _, confirm_code = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('导入成功', confirm_code == 200, 'status=%d' % confirm_code)
+
+    success_app_id = None
+    for r in safe_get(confirm_result, 'records', []):
+        if safe_get(r, 'status') == 'import_success':
+            success_app_id = safe_get(r, 'application_id')
+            break
+    check('成功记录有申请ID', success_app_id is not None, 'app_id=%s' % success_app_id)
+
+    if success_app_id:
+        _post('/applications/%d/approve' % success_app_id, {'operator': '张三', 'comment': '批量导入测试审批'})
+
+    logs = _get('/audit-logs?limit=200')
+    actions = [safe_get(l, 'action') for l in logs if isinstance(l, dict)]
+    check('日志包含 import_upload', 'import_upload' in actions, 'actions=%s' % actions)
+    check('日志包含 import_confirm', 'import_confirm' in actions, 'actions=%s' % actions)
+    check('日志包含 import_complete', 'import_complete' in actions, 'actions=%s' % actions)
+    check('日志包含 import_create_application', 'import_create_application' in actions, 'actions=%s' % actions)
+
+    import_complete_log = next((l for l in logs if isinstance(l, dict) and safe_get(l, 'action') == 'import_complete'), None)
+    check('import_complete 日志有详情',
+          import_complete_log and '成功' in safe_get(import_complete_log, 'detail', ''),
+          'detail=%s' % (safe_get(import_complete_log, 'detail') if import_complete_log else ''))
+
+    csv_bytes, csv_status, _ = _get_raw('/schedule/' + test_date + '/export?operator=张三')
+    check('CSV导出成功', csv_status == 200, 'status=%d' % csv_status)
+    csv_text = csv_bytes.decode('utf-8-sig', errors='replace') if csv_bytes else ''
+    target_event = unique_name('导入日志测试')
+    check('导出CSV包含导入的活动', target_event in csv_text, 'found=%s' % (target_event in csv_text))
+
+
+def test_import_persistence_after_restart():
+    print('\n=== 19. 批量导入：重启后数据一致性 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 35)).isoformat()
+
+    csv_rows = [
+        ['会议室B', unique_name('导入持久化-A'), '张三', test_date, '09:00', '10:00', '20'],
+        ['不存在场地', unique_name('导入持久化-B'), '李四', test_date, '10:00', '11:00', '10'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, err, code = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'test_persist.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传成功', code == 201, 'status=%d err=%s' % (code, err))
+    batch_id = safe_get(result, 'id')
+    if batch_id is None:
+        return
+
+    confirm_result, _, confirm_code = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('导入完成', confirm_code == 200, 'status=%d' % confirm_code)
+
+    success_count_before = safe_get(confirm_result, 'success_count')
+    failed_count_before = safe_get(confirm_result, 'failed_count')
+    success_app_id = None
+    for r in safe_get(confirm_result, 'records', []):
+        if safe_get(r, 'status') == 'import_success':
+            success_app_id = safe_get(r, 'application_id')
+            break
+
+    detail_before = _get('/import/%d?operator=张三' % batch_id)
+    failure_summary_before = safe_get(detail_before, 'failure_summary')
+
+    global _client
+    old_client = _client
+    _client = None
+    import app as _app_module_3
+    _client = _app_module_3.app.test_client()
+
+    detail_after = _get('/import/%d?operator=张三' % batch_id)
+    check('重建客户端后批次仍存在', safe_get(detail_after, 'id') == batch_id,
+          'id=%s' % safe_get(detail_after, 'id'))
+    check('重建客户端后 success_count 一致',
+          safe_get(detail_after, 'success_count') == success_count_before,
+          'before=%s after=%s' % (success_count_before, safe_get(detail_after, 'success_count')))
+    check('重建客户端后 failed_count 一致',
+          safe_get(detail_after, 'failed_count') == failed_count_before,
+          'before=%s after=%s' % (failed_count_before, safe_get(detail_after, 'failed_count')))
+    check('重建客户端后 failure_summary 一致',
+          safe_get(detail_after, 'failure_summary') == failure_summary_before,
+          'before=%s after=%s' % (failure_summary_before, safe_get(detail_after, 'failure_summary')))
+
+    records_after = safe_get(detail_after, 'records', [])
+    check('重建客户端后记录数一致', len(records_after) == 2, 'count=%d' % len(records_after))
+
+    if success_app_id:
+        app_after = _get('/applications/%d' % success_app_id)
+        check('重建客户端后导入的申请仍存在',
+              safe_get(app_after, 'id') == success_app_id,
+              'id=%s' % safe_get(app_after, 'id'))
+        check('重建客户端后申请状态正确',
+              safe_get(app_after, 'status') == 'pending_approval',
+              'status=%s' % safe_get(app_after, 'status'))
+
+    list_after = _get('/import?operator=张三')
+    batch_in_list = next((b for b in list_after if safe_get(b, 'id') == batch_id), None)
+    check('重建客户端后批次在列表中', batch_in_list is not None, 'found=%s' % (batch_in_list is not None))
+
+    logs_after = _get('/audit-logs?limit=200')
+    has_import_log = any(safe_get(l, 'action') in ('import_upload', 'import_confirm', 'import_complete')
+                         and safe_get(l, 'target_id') == batch_id
+                         for l in logs_after if isinstance(l, dict))
+    check('重建客户端后导入操作日志仍存在', has_import_log,
+          'actions=%s' % sorted(set(safe_get(l, 'action') for l in logs_after if isinstance(l, dict))))
+
+    csv_bytes, csv_status, _ = _get_raw('/schedule/' + test_date + '/export?operator=张三')
+    csv_text = csv_bytes.decode('utf-8-sig', errors='replace') if csv_bytes else ''
+    target_event = unique_name('导入持久化-A')
+    check('重建客户端后导出CSV仍包含导入数据', target_event in csv_text,
+          'found=%s' % (target_event in csv_text))
+
+    _client = old_client
+
+
+def test_import_repreview_and_cancel():
+    print('\n=== 20. 批量导入：重新预演与取消批次 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 36)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('导入重预演-A'), '张三', test_date, '09:00', '10:00', '20'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, err, code = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'test_repreview.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传成功', code == 201, 'status=%d err=%s' % (code, err))
+    batch_id = safe_get(result, 'id')
+    if batch_id is None:
+        return
+
+    repreview_result, _, repreview_code = _post('/import/%d/preview' % batch_id, {'operator': '张三'})
+    check('重新预演返回200', repreview_code == 200, 'status=%d' % repreview_code)
+    check('重新预演后状态仍为 preview',
+          safe_get(repreview_result, 'status') == 'preview',
+          'status=%s' % safe_get(repreview_result, 'status'))
+
+    cancel_result, _, cancel_code = _post('/import/%d/cancel' % batch_id, {'operator': '张三'})
+    check('取消批次返回200', cancel_code == 200, 'status=%d' % cancel_code)
+    check('取消后状态为 cancelled',
+          safe_get(cancel_result, 'status') == 'cancelled',
+          'status=%s' % safe_get(cancel_result, 'status'))
+
+    _, confirm_err, confirm_code = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('已取消批次不能确认导入', confirm_code != 200, 'status=%d err=%s' % (confirm_code, confirm_err))
+
+
 if __name__ == '__main__':
     print('=' * 60)
     print('场地排期系统 - 权限修复回归测试')
@@ -782,6 +1206,13 @@ if __name__ == '__main__':
     run_safe('11.重启一致性', test_precheck_persistence_after_restart)
     run_safe('12.普通身份越权拦截', test_applicant_cannot_see_or_access_approval)
     run_safe('13.预检链路中文参数', test_precheck_full_link_zh_params)
+    run_safe('14.批量导入全部通过', test_import_all_pass)
+    run_safe('15.批量导入部分失败', test_import_partial_failure)
+    run_safe('16.批量导入重复检测', test_import_duplicate_in_batch)
+    run_safe('17.批量导入权限控制', test_import_permission_control)
+    run_safe('18.批量导入日志与导出', test_import_logs_and_export)
+    run_safe('19.批量导入重启一致性', test_import_persistence_after_restart)
+    run_safe('20.批量导入重预演与取消', test_import_repreview_and_cancel)
 
     print()
     print('=' * 60)
