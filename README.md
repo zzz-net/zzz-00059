@@ -132,6 +132,7 @@ python app.py
 | GET | `/api/schedule/{date}` | 当日排期视图 |
 | GET | `/api/schedule/{date}/export` | 导出当日排期 CSV |
 | GET | `/api/audit-logs` | 操作日志 |
+| GET | `/api/auth/info?name=xxx` | 查询指定用户是否为审批人 |
 
 ## 项目结构
 
