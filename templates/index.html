@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>活动场地排期系统</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <h1>🏢 活动场地排期系统</h1>
+            <div class="operator-bar">
+                <label>当前操作人：</label>
+                <input type="text" id="currentOperator" value="张三" placeholder="输入你的名字">
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <button class="tab-btn active" data-tab="venues">场地管理</button>
+            <button class="tab-btn" data-tab="applications">申请管理</button>
+            <button class="tab-btn" data-tab="approval">审批面板</button>
+            <button class="tab-btn" data-tab="schedule">排期视图</button>
+            <button class="tab-btn" data-tab="logs">操作日志</button>
+        </nav>
+
+        <main class="content">
+            <section id="tab-venues" class="tab-panel active">
+                <div class="panel-header">
+                    <h2>场地列表</h2>
+                    <button class="btn btn-primary" onclick="openVenueModal()">+ 新增场地</button>
+                </div>
+                <div id="venueList" class="card-grid"></div>
+            </section>
+
+            <section id="tab-applications" class="tab-panel">
+                <div class="panel-header">
+                    <h2>申请列表</h2>
+                    <div class="filter-bar">
+                        <select id="filterStatus" onchange="loadApplications()">
+                            <option value="">全部状态</option>
+                            <option value="submitted">已提交</option>
+                            <option value="pending_approval">待审批</option>
+                            <option value="confirmed">已确认</option>
+                            <option value="cancelled">已取消</option>
+                            <option value="rejected">已驳回</option>
+                        </select>
+                        <button class="btn btn-primary" onclick="openApplicationModal()">+ 新建申请</button>
+                    </div>
+                </div>
+                <div id="applicationList" class="list-container"></div>
+            </section>
+
+            <section id="tab-approval" class="tab-panel">
+                <div class="panel-header">
+                    <h2>待审批申请</h2>
+                </div>
+                <div id="approvalList" class="list-container"></div>
+            </section>
+
+            <section id="tab-schedule" class="tab-panel">
+                <div class="panel-header">
+                    <h2>排期视图</h2>
+                    <div class="filter-bar">
+                        <input type="date" id="scheduleDate" onchange="loadSchedule()">
+                        <button class="btn btn-success" onclick="exportSchedule()">📥 导出CSV</button>
+                    </div>
+                </div>
+                <div id="scheduleView" class="schedule-container"></div>
+            </section>
+
+            <section id="tab-logs" class="tab-panel">
+                <div class="panel-header">
+                    <h2>操作日志（审计）</h2>
+                    <button class="btn" onclick="loadAuditLogs()">刷新</button>
+                </div>
+                <div id="auditLogList" class="log-list"></div>
+            </section>
+        </main>
+    </div>
+
+    <div id="venueModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="venueModalTitle">新增场地</h3>
+                <button class="close-btn" onclick="closeVenueModal()">&times;</button>
+            </div>
+            <form id="venueForm" onsubmit="saveVenue(event)">
+                <input type="hidden" id="venueId">
+                <div class="form-group">
+                    <label>场地名称 *</label>
+                    <input type="text" id="venueName" required>
+                </div>
+                <div class="form-group">
+                    <label>描述</label>
+                    <textarea id="venueDesc" rows="2"></textarea>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>容量（人）</label>
+                        <input type="number" id="venueCapacity" value="0" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label>日配额（场）*</label>
+                        <input type="number" id="venueQuota" value="1" min="1" required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>开放时间 *</label>
+                        <input type="time" id="venueOpen" value="09:00" required>
+                    </div>
+                    <div class="form-group">
+                        <label>关闭时间 *</label>
+                        <input type="time" id="venueClose" value="18:00" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label><input type="checkbox" id="venueActive" checked> 启用</label>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn" onclick="closeVenueModal()">取消</button>
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="applicationModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>新建申请</h3>
+                <button class="close-btn" onclick="closeApplicationModal()">&times;</button>
+            </div>
+            <form id="applicationForm" onsubmit="saveApplication(event)">
+                <div class="form-group">
+                    <label>选择场地 *</label>
+                    <select id="appVenueId" required></select>
+                </div>
+                <div class="form-group">
+                    <label>活动名称 *</label>
+                    <input type="text" id="appEventName" required>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>申请人 *</label>
+                        <input type="text" id="appApplicant" required>
+                    </div>
+                    <div class="form-group">
+                        <label>联系电话</label>
+                        <input type="text" id="appPhone">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>活动描述</label>
+                    <textarea id="appDesc" rows="2"></textarea>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>参与人数</label>
+                        <input type="number" id="appParticipants" value="0" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label>申请日期 *</label>
+                        <input type="date" id="appDate" required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>开始时间 *</label>
+                        <input type="time" id="appStart" required>
+                    </div>
+                    <div class="form-group">
+                        <label>结束时间 *</label>
+                        <input type="time" id="appEnd" required>
+                    </div>
+                </div>
+                <div id="appFormError" class="form-error"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn" onclick="closeApplicationModal()">取消</button>
+                    <button type="submit" class="btn btn-primary">提交申请</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="detailModal" class="modal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3>申请详情</h3>
+                <button class="close-btn" onclick="closeDetailModal()">&times;</button>
+            </div>
+            <div id="detailContent"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
