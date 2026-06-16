@@ -97,11 +97,12 @@ def validate_import_record(record, venues_by_name, daily_usage_cache=None):
                 f'申请时段超出场地营业时间（{venue.open_time.strftime("%H:%M")}-{venue.close_time.strftime("%H:%M")}）')
 
     if venue and record.apply_date and record.start_time and record.end_time and not errors:
-        conflict_app = check_conflict(venue.id, record.apply_date,
-                                      record.start_time, record.end_time)
+        conflict_app = check_pending_conflict(venue.id, record.apply_date,
+                                              record.start_time, record.end_time)
         if conflict_app:
+            status_text = '已确认' if conflict_app.status == ApplicationStatus.CONFIRMED else '待审批'
             errors.append(
-                f'时段冲突：与申请 #{conflict_app.id}「{conflict_app.event_name}」时间重叠')
+                f'时段冲突：与{status_text}申请 #{conflict_app.id}「{conflict_app.event_name}」时间重叠')
 
     if venue and record.apply_date and not errors:
         quota_ok, current_count = check_daily_quota(venue, record.apply_date)
@@ -386,6 +387,28 @@ def _app_summary_dict(app):
 
 def build_precheck(application):
     venue = application.venue
+    if not venue:
+        return {
+            'application_id': application.id,
+            'venue_id': application.venue_id,
+            'venue_name': None,
+            'apply_date': application.apply_date.isoformat() if application.apply_date else None,
+            'start_time': application.start_time.strftime('%H:%M') if application.start_time else None,
+            'end_time': application.end_time.strftime('%H:%M') if application.end_time else None,
+            'status': application.status,
+            'confirmed_count': 0,
+            'daily_quota': 0,
+            'quota_remaining': 0,
+            'quota_ok': False,
+            'confirmed_conflicts': [],
+            'pending_conflicts': [],
+            'confirmed_same_day': [],
+            'pending_same_day': [],
+            'issues': ['场地不存在或已删除'],
+            'expected_result': 'error',
+            'conflict_summary': '场地不存在或已删除',
+        }
+
     venue_id = application.venue_id
     apply_date = application.apply_date
     start_t = application.start_time
@@ -1148,7 +1171,9 @@ def upload_import_csv():
 @app.route('/api/import', methods=['GET'])
 def list_import_batches():
     operator = request.args.get('operator', '').strip()
-    if operator and not is_approver(operator):
+    if not operator:
+        return jsonify({'error': '缺少操作人参数'}), 400
+    if not is_approver(operator):
         add_audit_log(operator, 'import_list_denied', 'import_batch', None,
                       '无权限查看导入列表被拒绝', request.remote_addr)
         return jsonify({'error': '无权查看导入列表，需审批人权限'}), 403
@@ -1160,7 +1185,9 @@ def list_import_batches():
 @app.route('/api/import/<int:batch_id>', methods=['GET'])
 def get_import_batch(batch_id):
     operator = request.args.get('operator', '').strip()
-    if operator and not is_approver(operator):
+    if not operator:
+        return jsonify({'error': '缺少操作人参数'}), 400
+    if not is_approver(operator):
         add_audit_log(operator, 'import_view_denied', 'import_batch', batch_id,
                       '无权限查看导入详情被拒绝', request.remote_addr)
         return jsonify({'error': '无权查看导入详情，需审批人权限'}), 403

@@ -1185,6 +1185,319 @@ def test_import_repreview_and_cancel():
     check('已取消批次不能确认导入', confirm_code != 200, 'status=%d err=%s' % (confirm_code, confirm_err))
 
 
+def test_import_fix_no_duplicate_across_batches():
+    """修复验证：跨批次去重，相同内容重复导入不会生成重复申请"""
+    print('\n=== 21. 修复验证：跨批次去重，重复导入不生成重复申请 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 60)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('跨批次去重测试'), '张三', test_date, '09:00', '10:00', '20'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result1, _, code1 = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'fix_nodup.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('第一次上传成功', code1 == 201, 'status=%d' % code1)
+    batch_id1 = safe_get(result1, 'id')
+    confirm1, _, _ = _post('/import/%d/confirm' % batch_id1, {'operator': '张三'})
+    check('第一次导入成功1条', safe_get(confirm1, 'success_count') == 1,
+          'success=%d' % safe_get(confirm1, 'success_count'))
+
+    result2, _, code2 = _post_multipart('/import/upload',
+                                         {'operator': '张三'},
+                                         [{'name': 'file', 'filename': 'fix_nodup.csv',
+                                           'content': csv_content, 'content_type': 'text/csv'}])
+    check('第二次上传成功', code2 == 201, 'status=%d' % code2)
+
+    records2 = safe_get(result2, 'records', [])
+    check('预演检测到与待审批申请冲突',
+          any('待审批申请' in safe_get(r, 'error_message', '') for r in records2),
+          'errors=%s' % [safe_get(r, 'error_message') for r in records2])
+
+    batch_id2 = safe_get(result2, 'id')
+    confirm2, _, _ = _post('/import/%d/confirm' % batch_id2, {'operator': '张三'})
+    check('第二次导入成功0条', safe_get(confirm2, 'success_count') == 0,
+          'success=%d' % safe_get(confirm2, 'success_count'))
+    check('第二次导入失败1条', safe_get(confirm2, 'failed_count') == 1,
+          'failed=%d' % safe_get(confirm2, 'failed_count'))
+
+    pending = _get('/applications?status=pending_approval&viewer=张三')
+    event_name = unique_name('跨批次去重测试')
+    app_count = sum(1 for a in pending if safe_get(a, 'event_name') == event_name)
+    check('待审批列表只有1条记录（无重复）', app_count == 1,
+          'count=%d (应为1)' % app_count)
+
+
+def test_import_fix_pending_list_no_500():
+    """修复验证：审批人查看待审批列表不会500（场地不存在的情况）"""
+    print('\n=== 22. 修复验证：待审批列表含无效场地申请时不500 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 61)).isoformat()
+
+    try:
+        from models import db, Application
+        import app as _app
+        with _app.app.app_context():
+            bad_app = Application(
+                venue_id=99999,
+                applicant_name='测试',
+                event_name=unique_name('无效场地待审批'),
+                apply_date=date.today() + timedelta(days=BASE_DAY_OFFSET + 61),
+                start_time=_app.parse_time_str('09:00'),
+                end_time=_app.parse_time_str('10:00'),
+                status='pending_approval',
+                created_by='system'
+            )
+            db.session.add(bad_app)
+            db.session.commit()
+            bad_app_id = bad_app.id
+
+        body, status = _get_with_status('/applications?status=pending_approval&viewer=张三')
+        check('待审批列表返回200（不再500）', status == 200, 'status=%d' % status)
+
+        if isinstance(body, list):
+            has_bad_app = any(safe_get(a, 'id') == bad_app_id for a in body)
+            check('无效场地的申请仍在列表中', has_bad_app, 'found=%s' % has_bad_app)
+
+            bad_app_detail = next((a for a in body if safe_get(a, 'id') == bad_app_id), None)
+            if bad_app_detail:
+                precheck = safe_get(bad_app_detail, 'precheck')
+                check('precheck字段存在', precheck is not None, 'precheck=%s' % precheck)
+                if precheck:
+                    check('precheck包含场地不存在错误',
+                          '场地不存在' in safe_get(precheck, 'conflict_summary', ''),
+                          'summary=%s' % safe_get(precheck, 'conflict_summary'))
+
+        with _app.app.app_context():
+            bad_app = Application.query.get(bad_app_id)
+            if bad_app:
+                db.session.delete(bad_app)
+                db.session.commit()
+    except Exception as e:
+        check('测试过程无异常', False, 'error=%s' % e)
+
+
+def test_import_fix_list_view_normal():
+    """修复验证：导入结果列表和详情回看正常"""
+    print('\n=== 23. 修复验证：导入结果列表和详情回看正常 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 62)).isoformat()
+
+    csv_rows = [
+        ['会议室B', unique_name('回看修复-成功'), '张三', test_date, '09:00', '10:00', '20'],
+        ['不存在场地', unique_name('回看修复-失败'), '李四', test_date, '10:00', '11:00', '10'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, _, code = _post_multipart('/import/upload',
+                                       {'operator': '张三'},
+                                       [{'name': 'file', 'filename': 'fix_view.csv',
+                                         'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传成功', code == 201, 'status=%d' % code)
+    batch_id = safe_get(result, 'id')
+    confirm_result, _, _ = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('导入成功1条失败1条',
+          safe_get(confirm_result, 'success_count') == 1 and safe_get(confirm_result, 'failed_count') == 1,
+          'success=%d failed=%d' % (safe_get(confirm_result, 'success_count'),
+                                     safe_get(confirm_result, 'failed_count')))
+
+    list_body, list_status = _get_with_status('/import?operator=张三')
+    check('导入列表返回200', list_status == 200, 'status=%d' % list_status)
+    check('导入列表是数组', isinstance(list_body, list), 'type=%s' % type(list_body))
+    if isinstance(list_body, list):
+        batch_in_list = next((b for b in list_body if safe_get(b, 'id') == batch_id), None)
+        check('列表中包含批次', batch_in_list is not None, 'found=%s' % (batch_in_list is not None))
+        if batch_in_list:
+            check('列表批次有正确的成功数', safe_get(batch_in_list, 'success_count') == 1,
+                  'success=%d' % safe_get(batch_in_list, 'success_count'))
+            check('列表批次有正确的失败数', safe_get(batch_in_list, 'failed_count') == 1,
+                  'failed=%d' % safe_get(batch_in_list, 'failed_count'))
+
+    detail_body, detail_status = _get_with_status('/import/%d?operator=张三' % batch_id)
+    check('导入详情返回200', detail_status == 200, 'status=%d' % detail_status)
+    check('详情包含records', safe_get(detail_body, 'records') is not None,
+          'keys=%s' % (list(detail_body.keys()) if isinstance(detail_body, dict) else []))
+
+    records = safe_get(detail_body, 'records', [])
+    success_rec = next((r for r in records if safe_get(r, 'status') == 'import_success'), None)
+    fail_rec = next((r for r in records if safe_get(r, 'status') == 'import_fail'), None)
+    check('有1条成功记录', success_rec is not None, 'found=%s' % (success_rec is not None))
+    check('有1条失败记录', fail_rec is not None, 'found=%s' % (fail_rec is not None))
+
+    if success_rec:
+        check('成功记录有application_id', safe_get(success_rec, 'application_id') is not None,
+              'app_id=%s' % safe_get(success_rec, 'application_id'))
+    if fail_rec:
+        check('失败记录有错误信息', len(safe_get(fail_rec, 'error_message', '')) > 0,
+              'error=%s' % safe_get(fail_rec, 'error_message'))
+
+
+def test_import_fix_no_dirty_data():
+    """修复验证：失败时不留下脏数据"""
+    print('\n=== 24. 修复验证：失败时不留下脏数据 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 63)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('脏数据修复-成功'), '张三', test_date, '09:00', '10:00', '20'],
+        ['不存在的场地', unique_name('脏数据修复-失败'), '李四', test_date, '10:00', '11:00', '10'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, _, code = _post_multipart('/import/upload',
+                                       {'operator': '张三'},
+                                       [{'name': 'file', 'filename': 'fix_dirty.csv',
+                                         'content': csv_content, 'content_type': 'text/csv'}])
+    batch_id = safe_get(result, 'id')
+
+    confirm_result, _, _ = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('导入成功1条失败1条',
+          safe_get(confirm_result, 'success_count') == 1 and safe_get(confirm_result, 'failed_count') == 1,
+          'success=%d failed=%d' % (safe_get(confirm_result, 'success_count'),
+                                     safe_get(confirm_result, 'failed_count')))
+
+    records = safe_get(confirm_result, 'records', [])
+    success_rec = next((r for r in records if safe_get(r, 'status') == 'import_success'), None)
+    fail_rec = next((r for r in records if safe_get(r, 'status') == 'import_fail'), None)
+
+    success_app_id = safe_get(success_rec, 'application_id')
+    check('成功记录有application_id', success_app_id is not None, 'app_id=%s' % success_app_id)
+    check('失败记录无application_id', safe_get(fail_rec, 'application_id') is None,
+          'app_id=%s' % safe_get(fail_rec, 'application_id'))
+
+    if success_app_id:
+        app_detail = _get('/applications/%d' % success_app_id)
+        check('成功的申请可查询', safe_get(app_detail, 'id') == success_app_id,
+              'id=%s' % safe_get(app_detail, 'id'))
+        check('成功的申请状态正确', safe_get(app_detail, 'status') == 'pending_approval',
+              'status=%s' % safe_get(app_detail, 'status'))
+
+    all_apps = _get('/applications?viewer=张三')
+    all_event_names = [safe_get(a, 'event_name', '') for a in all_apps if isinstance(a, dict)]
+    success_event = unique_name('脏数据修复-成功')
+    fail_event = unique_name('脏数据修复-失败')
+    check('成功的活动已入库', any(success_event in name for name in all_event_names),
+          'found_success=%s' % any(success_event in name for name in all_event_names))
+    check('失败的活动未入库', not any(fail_event in name for name in all_event_names),
+          'found_fail=%s' % any(fail_event in name for name in all_event_names))
+
+
+def test_import_fix_restart_export():
+    """修复验证：重启后导出不出现重复记录，数据一致"""
+    print('\n=== 25. 修复验证：重启后导出无重复，数据一致 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 64)).isoformat()
+
+    csv_rows = [
+        ['多功能厅A', unique_name('重启导出修复'), '张三', test_date, '09:00', '10:00', '20'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, _, _ = _post_multipart('/import/upload',
+                                    {'operator': '张三'},
+                                    [{'name': 'file', 'filename': 'fix_restart.csv',
+                                      'content': csv_content, 'content_type': 'text/csv'}])
+    batch_id = safe_get(result, 'id')
+    confirm_result, _, _ = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    batch_id = safe_get(confirm_result, 'id')
+    success_count = safe_get(confirm_result, 'success_count')
+    failed_count = safe_get(confirm_result, 'failed_count')
+
+    check('导入成功1条', success_count == 1, 'success=%d' % success_count)
+
+    success_app_id = None
+    for r in safe_get(confirm_result, 'records', []):
+        if safe_get(r, 'status') == 'import_success':
+            success_app_id = safe_get(r, 'application_id')
+            break
+
+    csv_bytes1, csv_status1, _ = _get_raw('/schedule/' + test_date + '/export?operator=张三')
+    csv_text1 = csv_bytes1.decode('utf-8-sig', errors='replace') if csv_bytes1 else ''
+    event_name = unique_name('重启导出修复')
+    count_before = csv_text1.count(event_name)
+    check('重启前导出1条记录', count_before == 1, 'count=%d' % count_before)
+
+    global _client
+    old_client = _client
+    _client = None
+    import app as _app_module3
+    _client = _app_module3.app.test_client()
+
+    detail_after = _get('/import/%d?operator=张三' % batch_id)
+    check('重启后批次仍存在', safe_get(detail_after, 'id') == batch_id,
+          'id=%s' % safe_get(detail_after, 'id'))
+    check('重启后success_count一致', safe_get(detail_after, 'success_count') == success_count,
+          'before=%s after=%s' % (success_count, safe_get(detail_after, 'success_count')))
+    check('重启后failed_count一致', safe_get(detail_after, 'failed_count') == failed_count,
+          'before=%s after=%s' % (failed_count, safe_get(detail_after, 'failed_count')))
+
+    if success_app_id:
+        app_after = _get('/applications/%d' % success_app_id)
+        check('重启后申请仍存在', safe_get(app_after, 'id') == success_app_id,
+              'id=%s' % safe_get(app_after, 'id'))
+
+    csv_bytes2, csv_status2, _ = _get_raw('/schedule/' + test_date + '/export?operator=张三')
+    csv_text2 = csv_bytes2.decode('utf-8-sig', errors='replace') if csv_bytes2 else ''
+    count_after = csv_text2.count(event_name)
+    check('重启后导出仍为1条记录（无重复）', count_after == 1, 'count=%d' % count_after)
+
+    list_after = _get('/import?operator=张三')
+    check('重启后批次在列表中',
+          any(safe_get(b, 'id') == batch_id for b in list_after) if isinstance(list_after, list) else False,
+          'found=%s' % (any(safe_get(b, 'id') == batch_id for b in list_after) if isinstance(list_after, list) else False))
+
+    logs_after = _get('/audit-logs?limit=200')
+    has_import_log = any(safe_get(l, 'action') in ('import_upload', 'import_confirm', 'import_complete')
+                         and safe_get(l, 'target_id') == batch_id
+                         for l in logs_after if isinstance(l, dict))
+    check('重启后导入操作日志仍存在', has_import_log, 'has_log=%s' % has_import_log)
+
+    _client = old_client
+
+
+def test_import_fix_pending_conflict_detection():
+    """修复验证：与待审批申请冲突也能检测到"""
+    print('\n=== 26. 修复验证：与待审批申请冲突也能检测到 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 65)).isoformat()
+
+    app_result, _, _ = _post('/applications', {
+        'venue_id': 1,
+        'event_name': unique_name('待审批冲突基线-修复'),
+        'applicant_name': '张三',
+        'apply_date': test_date,
+        'start_time': '10:00',
+        'end_time': '11:00',
+    })
+    baseline_app_id = safe_get(app_result, 'id')
+    check('基线申请创建成功', baseline_app_id is not None, 'id=%s' % baseline_app_id)
+
+    app_detail = _get('/applications/%d' % baseline_app_id)
+    check('基线申请状态为pending_approval',
+          safe_get(app_detail, 'status') == 'pending_approval',
+          'status=%s' % safe_get(app_detail, 'status'))
+
+    csv_rows = [
+        ['多功能厅A', unique_name('待审批冲突测试-修复'), '李四', test_date, '10:30', '11:30', '20'],
+    ]
+    csv_content = _make_csv(csv_rows)
+
+    result, _, code = _post_multipart('/import/upload',
+                                       {'operator': '张三'},
+                                       [{'name': 'file', 'filename': 'fix_pending.csv',
+                                         'content': csv_content, 'content_type': 'text/csv'}])
+    check('上传成功', code == 201, 'status=%d' % code)
+
+    records = safe_get(result, 'records', [])
+    check('预演检测到与待审批申请冲突',
+          any('待审批申请' in safe_get(r, 'error_message', '') for r in records),
+          'errors=%s' % [safe_get(r, 'error_message') for r in records])
+
+    batch_id = safe_get(result, 'id')
+    confirm_result, _, _ = _post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('导入成功0条', safe_get(confirm_result, 'success_count') == 0,
+          'success=%d' % safe_get(confirm_result, 'success_count'))
+    check('导入失败1条', safe_get(confirm_result, 'failed_count') == 1,
+          'failed=%d' % safe_get(confirm_result, 'failed_count'))
+
+
 if __name__ == '__main__':
     print('=' * 60)
     print('场地排期系统 - 权限修复回归测试')
@@ -1213,6 +1526,12 @@ if __name__ == '__main__':
     run_safe('18.批量导入日志与导出', test_import_logs_and_export)
     run_safe('19.批量导入重启一致性', test_import_persistence_after_restart)
     run_safe('20.批量导入重预演与取消', test_import_repreview_and_cancel)
+    run_safe('21.修复：跨批次去重不生成重复申请', test_import_fix_no_duplicate_across_batches)
+    run_safe('22.修复：待审批列表含无效场地不500', test_import_fix_pending_list_no_500)
+    run_safe('23.修复：导入结果列表和详情回看正常', test_import_fix_list_view_normal)
+    run_safe('24.修复：失败时不留下脏数据', test_import_fix_no_dirty_data)
+    run_safe('25.修复：重启后导出无重复数据一致', test_import_fix_restart_export)
+    run_safe('26.修复：与待审批申请冲突可检测', test_import_fix_pending_conflict_detection)
 
     print()
     print('=' * 60)
