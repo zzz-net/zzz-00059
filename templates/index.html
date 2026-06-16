@@ -12,7 +12,9 @@
             <h1>🏢 活动场地排期系统</h1>
             <div class="operator-bar">
                 <label>当前操作人：</label>
-                <input type="text" id="currentOperator" value="张三" placeholder="输入你的名字">
+                <input type="text" id="currentOperator" value="张三" placeholder="输入你的名字" onchange="refreshRole()">
+                <span id="roleBadge" class="status-badge status-confirmed">审批人</span>
+                <span class="role-hint" id="roleHint"></span>
             </div>
         </header>
 

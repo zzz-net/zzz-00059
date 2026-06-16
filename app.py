@@ -14,7 +14,34 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(os.path.dirn
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JSON_AS_ASCII'] = False
 
+APPROVERS = {'张三', '管理员', 'admin', 'Administrator'}
+
 db.init_app(app)
+
+_db_initialized = False
+
+
+@app.before_request
+def ensure_db_initialized():
+    global _db_initialized
+    if _db_initialized:
+        return
+    with app.app_context():
+        db.create_all()
+        init_seed_data()
+    _db_initialized = True
+
+
+def is_approver(name):
+    if not name:
+        return False
+    return name.strip() in APPROVERS
+
+
+def require_approver(operator):
+    if operator and operator.strip() in APPROVERS:
+        return True, None
+    return False, '无权执行该操作，需审批人权限'
 
 
 def parse_time_str(t):
@@ -121,6 +148,16 @@ def check_pending_conflict(venue_id, apply_date, start_t, end_t, exclude_app_id=
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/api/auth/info', methods=['GET'])
+def auth_info():
+    name = request.args.get('name', '').strip()
+    return jsonify({
+        'name': name,
+        'is_approver': is_approver(name),
+        'approvers': sorted(list(APPROVERS))
+    })
 
 
 @app.route('/api/venues', methods=['GET'])
@@ -337,6 +374,12 @@ def approve_application(app_id):
     data = request.get_json() or {}
     operator = data.get('operator', 'admin')
 
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'approve_denied', 'application', app_id,
+                      '无权限审批被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
     if app.status not in [ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED]:
         return jsonify({'error': f'当前状态为 {app.status}，不能审批通过'}), 400
 
@@ -388,6 +431,12 @@ def reject_application(app_id):
     operator = data.get('operator', 'admin')
     reason = data.get('reason', '')
 
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'reject_denied', 'application', app_id,
+                      '无权限驳回被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
     if app.status not in [ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED]:
         return jsonify({'error': f'当前状态为 {app.status}，不能驳回'}), 400
 
@@ -421,6 +470,11 @@ def cancel_application(app_id):
     operator = data.get('operator', app.applicant_name)
     reason = data.get('reason', '')
 
+    if not is_approver(operator) and operator.strip() != app.applicant_name.strip():
+        add_audit_log(operator, 'cancel_denied', 'application', app_id,
+                      '无权限取消被拒绝', request.remote_addr)
+        return jsonify({'error': '无权取消该申请，仅申请人本人或审批人可取消'}), 403
+
     if app.status in [ApplicationStatus.CANCELLED, ApplicationStatus.REJECTED]:
         return jsonify({'error': f'当前状态为 {app.status}，不能取消'}), 400
 
@@ -451,6 +505,12 @@ def revoke_cancellation(app_id):
 
     data = request.get_json() or {}
     operator = data.get('operator', 'admin')
+
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'revoke_denied', 'application', app_id,
+                      '无权限撤销取消被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
 
     if app.status != ApplicationStatus.CANCELLED:
         return jsonify({'error': f'当前状态为 {app.status}，只有已取消的申请可以撤销'}), 400
@@ -629,5 +689,4 @@ def create_tables():
 
 
 if __name__ == '__main__':
-    create_tables()
     app.run(debug=True, port=5001, host='0.0.0.0')

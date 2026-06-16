@@ -1,5 +1,8 @@
 const API = '/api';
 
+let CURRENT_IS_APPROVER = false;
+let APPROVER_LIST = [];
+
 const STATUS_MAP = {
     'submitted': '已提交',
     'pending_approval': '待审批',
@@ -19,6 +22,39 @@ const ACTION_MAP = {
 
 function getOperator() {
     return document.getElementById('currentOperator').value.trim() || '匿名';
+}
+
+async function refreshRole() {
+    const name = getOperator();
+    try {
+        const info = await apiGet('/auth/info?name=' + encodeURIComponent(name));
+        CURRENT_IS_APPROVER = info.is_approver;
+        APPROVER_LIST = info.approvers || [];
+
+        const badge = document.getElementById('roleBadge');
+        const hint = document.getElementById('roleHint');
+        if (CURRENT_IS_APPROVER) {
+            badge.textContent = '审批人';
+            badge.className = 'status-badge status-confirmed';
+            hint.textContent = '';
+        } else {
+            badge.textContent = '普通申请人';
+            badge.className = 'status-badge role-badge-applicant';
+            hint.textContent = '（审批人: ' + APPROVER_LIST.join('、') + '）';
+        }
+
+        const activeTab = document.querySelector('.tab-btn.active');
+        if (activeTab) {
+            const tab = activeTab.dataset.tab;
+            if (tab === 'venues') loadVenues();
+            if (tab === 'applications') loadApplications();
+            if (tab === 'approval') loadApprovalList();
+            if (tab === 'schedule') loadSchedule();
+            if (tab === 'logs') loadAuditLogs();
+        }
+    } catch (e) {
+        console.error('刷新角色失败', e);
+    }
 }
 
 async function apiGet(url) {
@@ -193,14 +229,16 @@ function renderAppItem(a) {
 
 function renderAppActions(a) {
     let html = '';
-    if (a.status === 'pending_approval' || a.status === 'submitted') {
+    const op = getOperator();
+    const isOwner = a.applicant_name && a.applicant_name.trim() === op.trim();
+    if (CURRENT_IS_APPROVER && (a.status === 'pending_approval' || a.status === 'submitted')) {
         html += `<button class="btn btn-sm btn-success" onclick="approveApp(${a.id})">通过</button>`;
         html += `<button class="btn btn-sm btn-danger" onclick="rejectApp(${a.id})">驳回</button>`;
     }
-    if (a.status === 'confirmed' || a.status === 'pending_approval' || a.status === 'submitted') {
+    if ((CURRENT_IS_APPROVER || isOwner) && (a.status === 'confirmed' || a.status === 'pending_approval' || a.status === 'submitted')) {
         html += `<button class="btn btn-sm btn-warning" onclick="cancelApp(${a.id})">取消</button>`;
     }
-    if (a.status === 'cancelled') {
+    if (CURRENT_IS_APPROVER && a.status === 'cancelled') {
         html += `<button class="btn btn-sm" onclick="revokeApp(${a.id})">撤销取消</button>`;
     }
     return html;
@@ -312,14 +350,16 @@ function showAppDetail(id) {
 
 function renderDetailActions(app) {
     let html = '';
-    if (app.status === 'pending_approval' || app.status === 'submitted') {
+    const op = getOperator();
+    const isOwner = app.applicant_name && app.applicant_name.trim() === op.trim();
+    if (CURRENT_IS_APPROVER && (app.status === 'pending_approval' || app.status === 'submitted')) {
         html += `<button class="btn btn-success" onclick="approveApp(${app.id}); closeDetailModal();">审批通过</button>`;
         html += `<button class="btn btn-danger" onclick="rejectApp(${app.id}); closeDetailModal();">审批驳回</button>`;
     }
-    if (['confirmed', 'pending_approval', 'submitted'].includes(app.status)) {
+    if ((CURRENT_IS_APPROVER || isOwner) && ['confirmed', 'pending_approval', 'submitted'].includes(app.status)) {
         html += `<button class="btn btn-warning" onclick="cancelApp(${app.id}); closeDetailModal();">取消申请</button>`;
     }
-    if (app.status === 'cancelled') {
+    if (CURRENT_IS_APPROVER && app.status === 'cancelled') {
         html += `<button class="btn btn-primary" onclick="revokeApp(${app.id}); closeDetailModal();">撤销取消</button>`;
     }
     return html;
@@ -465,8 +505,10 @@ function escapeHtml(str) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    loadVenues();
-    loadApplications();
+    refreshRole().then(() => {
+        loadVenues();
+        loadApplications();
+    });
 });
 
 window.addEventListener('click', (e) => {

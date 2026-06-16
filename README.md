@@ -19,6 +19,11 @@
 3. **审批时**：当日已确认数量不能超过日配额
 4. **撤销取消时**：重新检查时段冲突和日配额
 
+### 权限规则
+- **审批人**：可以审批通过/驳回、撤销取消、取消任意申请
+- **普通申请人**：只能提交申请、取消自己的申请，不能审批
+- 默认审批人名单：`张三`、`管理员`、`admin`、`Administrator`（可在 `app.py` 的 `APPROVERS` 中修改）
+
 ## 本地启动
 
 ### 环境要求
@@ -37,7 +42,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-启动后访问：http://localhost:5000
+启动后访问：http://localhost:5001
 
 数据存储在项目根目录下的 `scheduling.db`（SQLite 文件），重启不丢失。
 
