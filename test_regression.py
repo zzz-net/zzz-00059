@@ -1,5 +1,6 @@
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 import time
 import traceback
@@ -58,13 +59,17 @@ def _post(path, data):
                 return None, str(e), e.code
 
 
+def _enc(url):
+    return urllib.parse.quote(url, safe='/:?=&%,')
+
+
 def _get(path):
     if TEST_MODE == 'direct':
         c = _get_client()
         r = c.get(API + path)
         return r.get_json(silent=True) or json.loads(r.data or '[]')
     else:
-        with urllib.request.urlopen(API + path) as r:
+        with urllib.request.urlopen(_enc(API + path)) as r:
             return json.loads(r.read())
 
 
@@ -75,7 +80,7 @@ def _get_with_status(path):
         return r.get_json(silent=True) or json.loads(r.data or '{}'), r.status_code
     else:
         try:
-            with urllib.request.urlopen(API + path) as r:
+            with urllib.request.urlopen(_enc(API + path)) as r:
                 return json.loads(r.read()), r.status
         except urllib.error.HTTPError as e:
             try:
@@ -90,7 +95,7 @@ def _get_raw(path):
         r = c.get(API + path)
         return r.data, r.status_code, r.headers
     else:
-        with urllib.request.urlopen(API + path) as r:
+        with urllib.request.urlopen(_enc(API + path)) as r:
             return r.read(), r.status, dict(r.headers)
 
 
@@ -100,7 +105,7 @@ def _homepage():
         r = c.get('/')
         return r.data.decode('utf-8', errors='replace'), r.status_code
     else:
-        with urllib.request.urlopen(BASE + '/') as r:
+        with urllib.request.urlopen(_enc(BASE + '/')) as r:
             return r.read().decode('utf-8'), r.status
 
 
@@ -618,6 +623,144 @@ def test_precheck_persistence_after_restart():
     _client = old_client
 
 
+def test_applicant_cannot_see_or_access_approval():
+    print('\n=== 12. 普通身份：审批入口不可见且接口全拦截 ===')
+    html, status = _homepage()
+    check('首页正常返回', status == 200, 'status=%d' % status)
+    approval_btn_mark = 'tab-btn tab-approval" data-tab="approval" style="display:none;"'
+    check('审批面板Tab初始HTML包含display:none隐藏（入口不可见）',
+          approval_btn_mark in html, 'hidden marker present: %s' % ('YES' if approval_btn_mark in html else 'NO'))
+
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 20)).isoformat()
+    app1, _, code1 = _post('/applications', {
+        'venue_id': 1,
+        'event_name': unique_name('越权拦截测试-待审批'),
+        'applicant_name': '李四',
+        'apply_date': test_date,
+        'start_time': '09:00',
+        'end_time': '10:00',
+        'created_by': '李四'
+    })
+    app_id = safe_get(app1, 'id')
+    check('申请创建成功', app_id is not None, 'http=%d id=%s' % (code1, app_id))
+    if app_id is None:
+        return
+
+    _, deny_code = _get_with_status('/applications?status=pending_approval&viewer=李四')
+    check('普通身份调用status=pending_approval列表返回403（后端兜底）',
+          deny_code == 403, 'status=%d' % deny_code)
+
+    list_nopre, _ = _get_with_status('/applications?status=pending_approval')
+    is_list = isinstance(list_nopre, list)
+    target_in_list = any(safe_get(a, 'id') == app_id for a in list_nopre) if is_list else False
+    check('无viewer时列表仍可访问(兼容)但不含precheck字段',
+          is_list and target_in_list and all('precheck' not in a for a in list_nopre),
+          'is_list=%s target_in=%s precheck_keys=%s' % (
+              is_list, target_in_list,
+              sorted(k for a in list_nopre[:1] for k in a.keys() if k == 'precheck')))
+
+    _, deny_precheck = _get_with_status('/applications/%d/precheck?operator=李四' % app_id)
+    check('普通身份调用预检接口返回403', deny_precheck == 403, 'status=%d' % deny_precheck)
+
+    _, err_app, code_app = _post('/applications/%d/approve' % app_id, {'operator': '李四'})
+    check('普通身份审批返回403', code_app == 403, 'status=%d err=%s' % (code_app, err_app))
+
+    _, err_rj, code_rj = _post('/applications/%d/reject' % app_id, {'operator': '李四', 'reason': 'x'})
+    check('普通身份驳回返回403', code_rj == 403, 'status=%d err=%s' % (code_rj, err_rj))
+
+    detail_applicant, _ = _get_with_status('/applications/%d?viewer=李四' % app_id)
+    check('普通身份viewer查详情不附precheck字段',
+          isinstance(detail_applicant, dict) and 'precheck' not in detail_applicant,
+          'keys=%s' % sorted(detail_applicant.keys()) if isinstance(detail_applicant, dict) else 'N/A')
+
+    detail_approver, _ = _get_with_status('/applications/%d?viewer=张三' % app_id)
+    check('审批人viewer查详情能拿到precheck字段（权限差异一致）',
+          isinstance(detail_approver, dict) and 'precheck' in detail_approver,
+          'keys=%s' % sorted(detail_approver.keys()) if isinstance(detail_approver, dict) else 'N/A')
+
+
+def test_precheck_full_link_zh_params():
+    print('\n=== 13. 预检链路中文参数完整跑通（预检通过+冲突提示+审批409） ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 21)).isoformat()
+
+    a, _, ca = _post('/applications', {
+        'venue_id': 2,
+        'event_name': unique_name('中文链路-A'),
+        'applicant_name': '王五',
+        'apply_date': test_date,
+        'start_time': '13:00',
+        'end_time': '14:00',
+    })
+    b, _, cb = _post('/applications', {
+        'venue_id': 2,
+        'event_name': unique_name('中文链路-B'),
+        'applicant_name': '赵六',
+        'apply_date': test_date,
+        'start_time': '13:30',
+        'end_time': '14:30',
+    })
+    id_a = safe_get(a, 'id')
+    id_b = safe_get(b, 'id')
+    check('申请A/B创建成功', id_a is not None and id_b is not None,
+          'A=%d:%s B=%d:%s' % (ca, id_a, cb, id_b))
+    if id_a is None or id_b is None:
+        return
+
+    pc_b_before, pc_code_before = _get_with_status(
+        '/applications/%d/precheck?operator=张三' % id_b)
+    check('B首次预检返回200（中文operator参数正常）',
+          pc_code_before == 200, 'status=%d' % pc_code_before)
+    check('B首次预检expected=warning（仅待审批重叠，尚未确认冲突）',
+          safe_get(pc_b_before, 'expected_result') == 'warning',
+          'expected=%s' % safe_get(pc_b_before, 'expected_result'))
+
+    list_with_viewer = _get('/applications?status=pending_approval&viewer=张三')
+    b_in_list = next((x for x in list_with_viewer if safe_get(x, 'id') == id_b), None)
+    check('列表带viewer=张三（中文）返回数据并附precheck',
+          b_in_list is not None and 'precheck' in b_in_list,
+          'found=%s keys=%s' % (b_in_list is not None,
+                                 sorted(b_in_list.keys()) if b_in_list else []))
+
+    auth_info = _get('/auth/info?name=%E5%BC%A0%E4%B8%89')
+    check('auth/info?name=张三中文URL编码正常',
+          safe_get(auth_info, 'is_approver') is True, str(auth_info))
+
+    _post('/applications/%d/approve' % id_a, {'operator': '张三', 'comment': '同意A'})
+
+    pc_b_after, pc_code_after = _get_with_status(
+        '/applications/%d/precheck?operator=张三' % id_b)
+    check('A通过后B预检返回200', pc_code_after == 200, 'status=%d' % pc_code_after)
+    check('A通过后B预检expected_result=conflict',
+          safe_get(pc_b_after, 'expected_result') == 'conflict',
+          'expected=%s' % safe_get(pc_b_after, 'expected_result'))
+    cfs = safe_get(pc_b_after, 'confirmed_conflicts', [])
+    check('A通过后B的confirmed_conflicts含A',
+          len(cfs) == 1 and safe_get(cfs[0], 'id') == id_a,
+          'conflicts=%s' % cfs)
+
+    _, err409, code409 = _post('/applications/%d/approve' % id_b, {
+        'operator': '张三', 'comment': '试一下通过B'
+    })
+    check('B正式审批稳定返回409（预检不替代正式校验）',
+          code409 == 409, 'status=%d err=%s' % (code409, err409))
+    check('409错误含冲突字样', err409 and '冲突' in err409, 'err=%s' % err409)
+
+    detail_b, _ = _get_with_status('/applications/%d' % id_b)
+    check('最终approval_conclusion含冲突说明',
+          safe_get(detail_b, 'approval_conclusion') and '冲突' in safe_get(detail_b, 'approval_conclusion'),
+          'conclusion=%s' % safe_get(detail_b, 'approval_conclusion'))
+    check('conflict_summary持久化含A的id',
+          safe_get(detail_b, 'conflict_summary') and ('#%d' % id_a) in safe_get(detail_b, 'conflict_summary'),
+          'summary=%s' % safe_get(detail_b, 'conflict_summary'))
+
+    csv_bytes, csv_status, _ = _get_raw('/schedule/' + test_date + '/export?operator=测试员')
+    check('CSV导出operator=测试员（中文）200', csv_status == 200, 'status=%d bytes=%d' % (csv_status, len(csv_bytes) if csv_bytes else 0))
+    csv_text = csv_bytes.decode('utf-8-sig', errors='replace') if csv_bytes else ''
+    check('CSV表头含冲突摘要和审批结论（HTTP中文环境下无乱码崩溃）',
+          '冲突摘要' in csv_text and '审批结论' in csv_text,
+          'header=%s' % csv_text.split('\n')[0][:150])
+
+
 if __name__ == '__main__':
     print('=' * 60)
     print('场地排期系统 - 权限修复回归测试')
@@ -637,6 +780,8 @@ if __name__ == '__main__':
     run_safe('9.预检冲突+409', test_precheck_conflict_formal_still_409)
     run_safe('10.导出新增字段', test_export_includes_new_columns)
     run_safe('11.重启一致性', test_precheck_persistence_after_restart)
+    run_safe('12.普通身份越权拦截', test_applicant_cannot_see_or_access_approval)
+    run_safe('13.预检链路中文参数', test_precheck_full_link_zh_params)
 
     print()
     print('=' * 60)

@@ -41,14 +41,31 @@ async function refreshRole() {
 
         const badge = document.getElementById('roleBadge');
         const hint = document.getElementById('roleHint');
+        const approvalBtns = document.querySelectorAll('.tab-btn[data-tab="approval"]');
+        const approvalPanel = document.getElementById('tab-approval');
         if (CURRENT_IS_APPROVER) {
             badge.textContent = '审批人';
             badge.className = 'status-badge status-confirmed';
             hint.textContent = '';
+            approvalBtns.forEach(b => b.style.display = '');
+            if (approvalPanel) approvalPanel.style.display = '';
         } else {
             badge.textContent = '普通申请人';
             badge.className = 'status-badge role-badge-applicant';
             hint.textContent = '（审批人: ' + APPROVER_LIST.join('、') + '）';
+            approvalBtns.forEach(b => b.style.display = 'none');
+            const activeApprovalBtn = document.querySelector('.tab-btn.active[data-tab="approval"]');
+            if (activeApprovalBtn || (approvalPanel && approvalPanel.classList.contains('active'))) {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                const firstBtn = document.querySelector('.tab-btn[data-tab="venues"]');
+                const firstPanel = document.getElementById('tab-venues');
+                if (firstBtn) firstBtn.classList.add('active');
+                if (firstPanel) firstPanel.classList.add('active');
+                loadVenues();
+                return;
+            }
+            if (approvalPanel) approvalPanel.style.display = 'none';
         }
 
         const activeTab = document.querySelector('.tab-btn.active');
@@ -104,6 +121,10 @@ async function apiDelete(url) {
 document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
         const tab = btn.dataset.tab;
+        if (tab === 'approval' && !CURRENT_IS_APPROVER) {
+            alert('无权访问审批面板，需审批人权限');
+            return;
+        }
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
         document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
         btn.classList.add('active');
@@ -450,6 +471,11 @@ function revokeApp(id) {
 }
 
 function loadApprovalList() {
+    if (!CURRENT_IS_APPROVER) {
+        const container = document.getElementById('approvalList');
+        if (container) container.innerHTML = '<div class="empty-state">无权访问，需审批人权限</div>';
+        return;
+    }
     const op = getOperator();
     const url = '/applications?status=pending_approval' + (op ? '&viewer=' + encodeURIComponent(op) : '');
     apiGet(url).then(apps => {

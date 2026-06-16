@@ -405,6 +405,11 @@ def list_applications():
     apply_date = request.args.get('apply_date')
     viewer = request.args.get('viewer', '').strip()
 
+    if status == ApplicationStatus.PENDING_APPROVAL and viewer and not is_approver(viewer):
+        add_audit_log(viewer, 'list_pending_denied', 'application', None,
+                      '普通身份试图列出待审批申请被拒绝', request.remote_addr)
+        return jsonify({'error': '无权查看待审批申请列表，需审批人权限'}), 403
+
     query = Application.query
     if venue_id:
         query = query.filter_by(venue_id=venue_id)
