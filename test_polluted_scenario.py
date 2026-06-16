@@ -2,26 +2,64 @@ import urllib.request
 import urllib.error
 import json
 import time
+import os
 from datetime import date, timedelta
 
-BASE = 'http://localhost:5001'
+TEST_MODE = os.environ.get('TEST_MODE', 'direct').lower()
+BASE = os.environ.get('TEST_BASE', 'http://localhost:5001')
 API = BASE + '/api'
+
 RUN_ID = 'POLLUTE' + time.strftime('%H%M%S')
-TARGET_DAY = date.today() + timedelta(days=10)
+POLLUTE_OFFSET = 20 + int(time.time()) % 10
+TARGET_DAY = date.today() + timedelta(days=POLLUTE_OFFSET)
+
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        import app as _app_module
+        _client = _app_module.app.test_client()
+    return _client
 
 
 def post(path, data):
-    req = urllib.request.Request(API + path, data=json.dumps(data).encode(),
-                                 headers={'Content-Type': 'application/json'}, method='POST')
-    try:
-        with urllib.request.urlopen(req) as r:
-            return json.loads(r.read()), None, r.status
-    except urllib.error.HTTPError as e:
+    if TEST_MODE == 'direct':
+        c = _get_client()
+        r = c.post(API + path, json=data)
         try:
-            err_data = json.loads(e.read())
-            return None, err_data.get('error', str(e)), e.code
+            body = r.get_json(silent=True) or json.loads(r.data or '{}')
         except Exception:
-            return None, str(e), e.code
+            body = None
+        if 200 <= r.status_code < 300:
+            return body, None, r.status_code
+        err = None
+        if isinstance(body, dict):
+            err = body.get('error')
+        return None, err or ('HTTP %d' % r.status_code), r.status_code
+    else:
+        req = urllib.request.Request(API + path, data=json.dumps(data).encode(),
+                                     headers={'Content-Type': 'application/json'}, method='POST')
+        try:
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read()), None, r.status
+        except urllib.error.HTTPError as e:
+            try:
+                err_data = json.loads(e.read())
+                return None, err_data.get('error', str(e)), e.code
+            except Exception:
+                return None, str(e), e.code
+
+
+def get_json(path):
+    if TEST_MODE == 'direct':
+        c = _get_client()
+        r = c.get(API + path)
+        return r.get_json(silent=True) or json.loads(r.data or '{}')
+    else:
+        with urllib.request.urlopen(API + path) as r:
+            return json.loads(r.read())
 
 
 def safe_get(d, key, default=None):
@@ -110,8 +148,7 @@ def test_scenario_2_conflict_then_continue():
     print('=' * 60)
 
     run_second = int(RUN_ID[-4:]) % 30
-    day = (date.today() + timedelta(days=100 + run_second)).isoformat()
-    ok_so_far = True
+    day = (date.today() + timedelta(days=100 + POLLUTE_OFFSET + run_second)).isoformat()
 
     app1, _, c1 = post('/applications', {
         'venue_id': 2, 'event_name': '连续-A-' + RUN_ID,
@@ -130,7 +167,7 @@ def test_scenario_2_conflict_then_continue():
     check('B 创建', id2 is not None, 'http=%d' % c2)
 
     if not id1 or not id2:
-        print('  → 预创建失败，跳过\n')
+        print('  -> 预创建失败，跳过\n')
         return True
 
     r1, _, code1 = post('/applications/%d/approve' % id1, {'operator': '张三'})
@@ -146,8 +183,7 @@ def test_scenario_2_conflict_then_continue():
     check('冲突后继续：仍能查询 A 状态（接口不崩）', True,
           '前面 B 冲突=r2 为 None，但后续 check() 正常执行')
     try:
-        with urllib.request.urlopen(API + '/applications/%d' % id1) as r:
-            final_body = json.loads(r.read())
+        final_body = get_json('/applications/%d' % id1)
     except Exception as e:
         final_body = {'error': str(e)}
     check('A 仍为 confirmed 状态', safe_get(final_body, 'status') == 'confirmed',
@@ -171,7 +207,7 @@ def test_scenario_3_null_result_safe():
             print('  [安全] ' + label)
             return True
         except AttributeError as e:
-            print('  [危险] ' + label + ' → AttributeError: %s' % e)
+            print('  [危险] ' + label + ' -> AttributeError: %s' % e)
             caught.append(label)
             return False
 
@@ -193,6 +229,8 @@ def test_scenario_3_null_result_safe():
 if __name__ == '__main__':
     print()
     print('★★★ 历史数据污染场景复现验证 ★★★')
+    print('模式: %s' % ('TEST_MODE=direct(Flask直连)' if TEST_MODE == 'direct' else 'TEST_MODE=http(%s)' % BASE))
+    print('RUN_ID: %s, 污染日期偏移: +%d 天' % (RUN_ID, POLLUTE_OFFSET))
     print('目标：验证修复后不会因为 DB 有历史数据而崩溃\n')
 
     pollute_venue_1()

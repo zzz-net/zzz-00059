@@ -3,35 +3,86 @@ import urllib.error
 import json
 import time
 import traceback
+import os
 from datetime import date, timedelta
 
-BASE = 'http://localhost:5001'
+TEST_MODE = os.environ.get('TEST_MODE', 'direct').lower()
+BASE = os.environ.get('TEST_BASE', 'http://localhost:5001')
 API = BASE + '/api'
 
 RUN_ID = time.strftime('%m%d%H%M%S')
-BASE_DAY_OFFSET = 10 + int(time.time()) % 50
+BASE_DAY_OFFSET = 200 + (int(time.time()) * 7 + 13) % 800
 
 PASS = 0
 FAIL = 0
 
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        import app as _app_module
+        _client = _app_module.app.test_client()
+    return _client
+
 
 def _post(path, data):
-    req = urllib.request.Request(API + path, data=json.dumps(data).encode(),
-                                 headers={'Content-Type': 'application/json'}, method='POST')
-    try:
-        with urllib.request.urlopen(req) as r:
-            return json.loads(r.read()), None, r.status
-    except urllib.error.HTTPError as e:
+    if TEST_MODE == 'direct':
+        c = _get_client()
+        r = c.post(API + path, json=data)
         try:
-            err_data = json.loads(e.read())
-            return None, err_data.get('error', str(e)), e.code
+            body = r.get_json(silent=True) or json.loads(r.data or '{}')
         except Exception:
-            return None, str(e), e.code
+            body = None
+        if 200 <= r.status_code < 300:
+            return body, None, r.status_code
+        err = None
+        if isinstance(body, dict):
+            err = body.get('error')
+        return None, err or ('HTTP %d' % r.status_code), r.status_code
+    else:
+        req = urllib.request.Request(API + path, data=json.dumps(data).encode(),
+                                     headers={'Content-Type': 'application/json'}, method='POST')
+        try:
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read()), None, r.status
+        except urllib.error.HTTPError as e:
+            try:
+                err_data = json.loads(e.read())
+                return None, err_data.get('error', str(e)), e.code
+            except Exception:
+                return None, str(e), e.code
 
 
 def _get(path):
-    with urllib.request.urlopen(API + path) as r:
-        return json.loads(r.read())
+    if TEST_MODE == 'direct':
+        c = _get_client()
+        r = c.get(API + path)
+        return r.get_json(silent=True) or json.loads(r.data or '[]')
+    else:
+        with urllib.request.urlopen(API + path) as r:
+            return json.loads(r.read())
+
+
+def _get_raw(path):
+    if TEST_MODE == 'direct':
+        c = _get_client()
+        r = c.get(API + path)
+        return r.data, r.status_code, r.headers
+    else:
+        with urllib.request.urlopen(API + path) as r:
+            return r.read(), r.status, dict(r.headers)
+
+
+def _homepage():
+    if TEST_MODE == 'direct':
+        c = _get_client()
+        r = c.get('/')
+        return r.data.decode('utf-8', errors='replace'), r.status_code
+    else:
+        with urllib.request.urlopen(BASE + '/') as r:
+            return r.read().decode('utf-8'), r.status
 
 
 def safe_get(d, key, default=None):
@@ -69,12 +120,10 @@ def unique_name(prefix):
 def test_homepage():
     print('\n=== 1. README 端口一致性 & 页面访问 ===')
     try:
-        req = urllib.request.Request(BASE + '/')
-        with urllib.request.urlopen(req) as r:
-            html = r.read().decode('utf-8')
-            check('首页 HTTP 200', r.status == 200, 'status=%d' % r.status)
-            check('首页包含"活动场地排期系统"标题', '活动场地排期系统' in html)
-            check('首页包含审批面板 Tab', '审批面板' in html)
+        html, status = _homepage()
+        check('首页 HTTP 200', status == 200, 'status=%d' % status)
+        check('首页包含"活动场地排期系统"标题', '活动场地排期系统' in html)
+        check('首页包含审批面板 Tab', '审批面板' in html)
     except Exception as e:
         check('首页访问', False, str(e))
 
@@ -300,13 +349,11 @@ def test_readme_steps_work():
         check('README 主流程排期视图可见', False, str(e))
 
     try:
-        req = urllib.request.Request(API + '/schedule/' + test_date + '/export?operator=test')
-        with urllib.request.urlopen(req) as r:
-            csv_bytes = r.read()
-            csv_text = csv_bytes.decode('utf-8-sig', errors='replace')
-            check('README 主流程 CSV 导出成功', len(csv_bytes) > 0,
-                  'bytes=%d' % len(csv_bytes))
-            check('CSV 包含表头字段', '活动名称' in csv_text)
+        csv_bytes, csv_status, _ = _get_raw('/schedule/' + test_date + '/export?operator=test')
+        csv_text = csv_bytes.decode('utf-8-sig', errors='replace')
+        check('README 主流程 CSV 导出成功', csv_status == 200 and len(csv_bytes) > 0,
+              'status=%d, bytes=%d' % (csv_status, len(csv_bytes)))
+        check('CSV 包含表头字段', '活动名称' in csv_text)
     except Exception as e:
         check('README 主流程 CSV 导出', False, str(e))
 
@@ -314,7 +361,7 @@ def test_readme_steps_work():
 if __name__ == '__main__':
     print('=' * 60)
     print('场地排期系统 - 权限修复回归测试')
-    print('测试目标: ' + BASE)
+    print('模式: %s' % ('TEST_MODE=direct(Flask直连)' if TEST_MODE == 'direct' else 'TEST_MODE=http(%s)' % BASE))
     print('本轮 RUN_ID: ' + RUN_ID)
     print('基准日偏移: +%d 天' % BASE_DAY_OFFSET)
     print('=' * 60)
