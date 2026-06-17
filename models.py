@@ -202,7 +202,7 @@ class ImportBatch(db.Model):
     records = db.relationship('ImportRecord', backref='batch', lazy=True,
                               cascade='all, delete-orphan', order_by='ImportRecord.line_number')
 
-    def to_dict(self, include_records=False, include_application_detail=False):
+    def to_dict(self, include_records=False, include_application_detail=False, viewer_role='approver'):
         from collections import Counter
 
         records_list = list(self.records)
@@ -291,7 +291,14 @@ class ImportBatch(db.Model):
             },
         }
         if include_records:
-            data['records'] = [r.to_dict(include_application_detail=include_application_detail) for r in records_list]
+            data['records'] = [r.to_dict(include_application_detail=include_application_detail, viewer_role=viewer_role) for r in records_list]
+        if viewer_role == 'applicant':
+            _BATCH_APPLICANT_STRIP = {
+                'id', 'filename', 'created_by', 'confirmed_by',
+                'confirmed_at', 'preview_summary', 'failure_summary',
+                'error_breakdown', 'approval_breakdown',
+            }
+            data = {k: v for k, v in data.items() if k not in _BATCH_APPLICANT_STRIP}
         return data
 
 
@@ -356,7 +363,7 @@ class ImportRecord(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    def to_dict(self, include_application_detail=False):
+    def to_dict(self, include_application_detail=False, viewer_role='approver'):
         data = {
             'id': self.id,
             'batch_id': self.batch_id,
@@ -415,4 +422,16 @@ class ImportRecord(db.Model):
                     'start_time': conflict_app.start_time.strftime('%H:%M') if conflict_app.start_time else None,
                     'end_time': conflict_app.end_time.strftime('%H:%M') if conflict_app.end_time else None,
                 }
+        if viewer_role == 'applicant':
+            _RECORD_APPLICANT_STRIP = {
+                'batch_id', 'line_number', 'error_category',
+                'error_category_label', 'conflict_with_application_id',
+                'raw_data',
+            }
+            data = {k: v for k, v in data.items() if k not in _RECORD_APPLICANT_STRIP}
+            if 'application' in data:
+                app_dict = data['application']
+                _APP_KEEP = {'id', 'status', 'status_label'}
+                data['application'] = {k: v for k, v in app_dict.items() if k in _APP_KEEP}
+            data.pop('conflict_application', None)
         return data

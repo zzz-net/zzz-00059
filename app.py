@@ -26,6 +26,15 @@ app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600
 
 APPROVERS = {'张三', '管理员', 'admin', 'Administrator'}
 
+
+def _is_cancelled_batch_duplicate(filename, operator):
+    existing = ImportBatch.query.filter(
+        ImportBatch.filename == filename,
+        ImportBatch.created_by == operator,
+        ImportBatch.status == ImportBatchStatus.CANCELLED
+    ).first()
+    return existing
+
 db.init_app(app)
 
 if os.environ.get('TEST_MODE') == 'http_process':
@@ -700,6 +709,8 @@ def list_applications():
     apply_date = request.args.get('apply_date')
     viewer = request.args.get('viewer', '').strip()
 
+    viewer_role = 'approver' if is_approver(viewer) else 'applicant'
+
     if status == ApplicationStatus.PENDING_APPROVAL and viewer and not is_approver(viewer):
         add_audit_log(viewer, 'list_pending_denied', 'application', None,
                       '普通身份试图列出待审批申请被拒绝', request.remote_addr)
@@ -713,10 +724,19 @@ def list_applications():
     if apply_date:
         query = query.filter_by(apply_date=parse_date_str(apply_date))
 
+    _APPLICANT_STRIP = {
+        'approved_by', 'approved_at', 'approval_comment',
+        'cancel_reason', 'cancelled_by', 'precheck_result',
+        'conflict_summary', 'approval_conclusion',
+        'last_precheck_at', 'last_precheck_by', 'previous_status',
+    }
+
     apps = query.order_by(Application.id.desc()).all()
     result = []
     for a in apps:
         d = a.to_dict()
+        if viewer_role == 'applicant':
+            d = {k: v for k, v in d.items() if k not in _APPLICANT_STRIP}
         if is_approver(viewer) and a.status in (ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED):
             d['precheck'] = build_precheck(a)
         result.append(d)
@@ -1061,21 +1081,39 @@ def get_schedule(date_str):
     except Exception:
         return jsonify({'error': '日期格式错误，应为 YYYY-MM-DD'}), 400
 
+    viewer = request.args.get('viewer', '').strip()
+    viewer_role = 'approver' if is_approver(viewer) else 'applicant'
+
     venues = Venue.query.filter_by(is_active=True).order_by(Venue.id.asc()).all()
     result = []
     for v in venues:
-        apps = Application.query.filter(
+        query = Application.query.filter(
             Application.venue_id == v.id,
             Application.apply_date == d,
             Application.status == ApplicationStatus.CONFIRMED
-        ).order_by(Application.start_time.asc()).all()
+        )
+        if viewer_role == 'applicant' and viewer:
+            query = query.filter(Application.applicant_name == viewer)
+        apps = query.order_by(Application.start_time.asc()).all()
 
-        result.append({
+        venue_data = {
             'venue': v.to_dict(),
             'confirmed_count': len(apps),
             'daily_quota': v.daily_quota,
-            'applications': [a.to_dict() for a in apps]
-        })
+            'applications': []
+        }
+        for a in apps:
+            ad = a.to_dict()
+            if viewer_role == 'applicant':
+                _SCHEDULE_APPLICANT_STRIP = {
+                    'approved_by', 'approved_at', 'approval_comment',
+                    'cancel_reason', 'cancelled_by', 'precheck_result',
+                    'conflict_summary', 'approval_conclusion',
+                    'last_precheck_at', 'last_precheck_by', 'previous_status',
+                }
+                ad = {k: v for k, v in ad.items() if k not in _SCHEDULE_APPLICANT_STRIP}
+            venue_data['applications'].append(ad)
+        result.append(venue_data)
 
     return jsonify({'date': d.isoformat(), 'venues': result})
 
@@ -1123,16 +1161,24 @@ def export_schedule(date_str):
 
     batch_id_filter = request.args.get('batch_id', type=int)
     operator = request.args.get('operator', 'anonymous').strip()
+    viewer_role = 'approver' if is_approver(operator) else 'applicant'
 
     venues = Venue.query.filter_by(is_active=True).order_by(Venue.id.asc()).all()
 
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow([
-        '日期', '场地', '活动名称', '申请人', '开始时间', '结束时间',
-        '参与人数', '状态', '审批人', '审批意见', '冲突摘要', '审批结论',
-        '导入批次ID', '导入文件名', 'CSV行号', '导入结果', '导入失败分类', '导入失败原因'
-    ])
+
+    if viewer_role == 'approver':
+        writer.writerow([
+            '日期', '场地', '活动名称', '申请人', '开始时间', '结束时间',
+            '参与人数', '状态', '审批人', '审批意见', '冲突摘要', '审批结论',
+            '导入批次ID', '导入文件名', 'CSV行号', '导入结果', '导入失败分类', '导入失败原因'
+        ])
+    else:
+        writer.writerow([
+            '日期', '场地', '活动名称', '申请人', '开始时间', '结束时间',
+            '参与人数', '状态'
+        ])
 
     apps_query = Application.query.filter(Application.apply_date == d)
 
@@ -1143,6 +1189,9 @@ def export_schedule(date_str):
             apps_query = apps_query.filter(Application.id.in_(filtered_app_ids))
         else:
             apps_query = apps_query.filter(Application.id == -1)
+
+    if viewer_role == 'applicant':
+        apps_query = apps_query.filter(Application.applicant_name == operator)
 
     all_apps = []
     for v in venues:
@@ -1157,31 +1206,45 @@ def export_schedule(date_str):
 
     for v, a in all_apps:
         batch_info = app_batch_map.get(a.id, {})
-        writer.writerow([
-            d.isoformat(),
-            v.name,
-            a.event_name,
-            a.applicant_name,
-            a.start_time.strftime('%H:%M'),
-            a.end_time.strftime('%H:%M'),
-            a.participants,
-            STATUS_EXPORT_LABEL.get(a.status, a.status),
-            a.approved_by or '',
-            a.approval_comment or '',
-            a.conflict_summary or '',
-            a.approval_conclusion or '',
-            batch_info.get('batch_id', '') or '',
-            batch_info.get('batch_filename', '') or '',
-            batch_info.get('line_number', '') or '',
-            batch_info.get('import_status', '') or '',
-            ERROR_CATEGORY_LABEL.get(batch_info.get('error_category', ''), '') or '',
-            batch_info.get('error_message', '') or '',
-        ])
+        if viewer_role == 'approver':
+            writer.writerow([
+                d.isoformat(),
+                v.name,
+                a.event_name,
+                a.applicant_name,
+                a.start_time.strftime('%H:%M'),
+                a.end_time.strftime('%H:%M'),
+                a.participants,
+                STATUS_EXPORT_LABEL.get(a.status, a.status),
+                a.approved_by or '',
+                a.approval_comment or '',
+                a.conflict_summary or '',
+                a.approval_conclusion or '',
+                batch_info.get('batch_id', '') or '',
+                batch_info.get('batch_filename', '') or '',
+                batch_info.get('line_number', '') or '',
+                batch_info.get('import_status', '') or '',
+                ERROR_CATEGORY_LABEL.get(batch_info.get('error_category', ''), '') or '',
+                batch_info.get('error_message', '') or '',
+            ])
+        else:
+            writer.writerow([
+                d.isoformat(),
+                v.name,
+                a.event_name,
+                a.applicant_name,
+                a.start_time.strftime('%H:%M'),
+                a.end_time.strftime('%H:%M'),
+                a.participants,
+                STATUS_EXPORT_LABEL.get(a.status, a.status),
+            ])
 
     csv_content = output.getvalue()
     output.close()
 
-    export_detail = f'导出 {d.isoformat()} 排期表（含冲突摘要、审批结论与批次摘要）'
+    export_detail = f'导出 {d.isoformat()} 排期表（{viewer_role}视角）'
+    if viewer_role == 'approver':
+        export_detail += '（含冲突摘要、审批结论与批次摘要）'
     if batch_id_filter:
         export_detail += f'，按批次#{batch_id_filter}筛选'
     add_audit_log(operator, 'export_schedule', 'schedule', None, export_detail, request.remote_addr)
@@ -1312,6 +1375,38 @@ def export_import_batch(batch_id):
     )
 
 
+@app.route('/api/my-schedule', methods=['GET'])
+def my_schedule_results():
+    operator = request.args.get('operator', '').strip()
+    if not operator:
+        return jsonify({'error': '缺少操作人参数'}), 400
+
+    viewer_role = 'approver' if is_approver(operator) else 'applicant'
+    apply_date_filter = request.args.get('apply_date', '').strip()
+
+    query = Application.query.filter(Application.applicant_name == operator)
+    if apply_date_filter:
+        query = query.filter(Application.apply_date == parse_date_str(apply_date_filter))
+
+    apps = query.order_by(Application.apply_date.desc(), Application.start_time.asc()).all()
+
+    _MY_SCHEDULE_APPLICANT_STRIP = {
+        'approved_by', 'approved_at', 'approval_comment',
+        'cancel_reason', 'cancelled_by', 'precheck_result',
+        'conflict_summary', 'approval_conclusion',
+        'last_precheck_at', 'last_precheck_by', 'previous_status',
+    }
+
+    result = []
+    for a in apps:
+        ad = a.to_dict()
+        if viewer_role == 'applicant':
+            ad = {k: v for k, v in ad.items() if k not in _MY_SCHEDULE_APPLICANT_STRIP}
+        result.append(ad)
+
+    return jsonify(result)
+
+
 @app.route('/api/audit-logs', methods=['GET'])
 def list_audit_logs():
     limit = request.args.get('limit', 100, type=int)
@@ -1340,6 +1435,16 @@ def upload_import_csv():
 
     if not file.filename.endswith('.csv'):
         return jsonify({'error': '仅支持 CSV 文件'}), 400
+
+    cancelled_dup = _is_cancelled_batch_duplicate(file.filename, operator)
+    if cancelled_dup:
+        add_audit_log(operator, 'import_upload_cancelled_dup', 'import_batch', cancelled_dup.id,
+                      f'已取消的历史导入再次上传被拦截，原批次#{cancelled_dup.id}', request.remote_addr)
+        return jsonify({
+            'error': f'该文件（{file.filename}）已存在已取消的导入批次（#{cancelled_dup.id}），属于历史重复，不能再重新建单',
+            'duplicate_batch_id': cancelled_dup.id,
+            'duplicate_batch_status': 'cancelled',
+        }), 409
 
     try:
         content = file.read().decode('utf-8-sig')
@@ -1416,16 +1521,27 @@ def list_import_batches():
     operator = request.args.get('operator', '').strip()
     if not operator:
         return jsonify({'error': '缺少操作人参数'}), 400
-    if not is_approver(operator):
-        add_audit_log(operator, 'import_list_denied', 'import_batch', None,
-                      '无权限查看导入列表被拒绝', request.remote_addr)
-        return jsonify({'error': '无权查看导入列表，需审批人权限'}), 403
+
+    viewer_role = 'approver' if is_approver(operator) else 'applicant'
+
+    if viewer_role == 'applicant':
+        add_audit_log(operator, 'import_list_applicant', 'import_batch', None,
+                      '申请人查看自己相关的批次列表', request.remote_addr)
 
     status_filter = request.args.get('batch_status', '').strip()
     approval_status_filter = request.args.get('approval_status', '').strip()
     result_filter = request.args.get('import_result', '').strip()
 
     query = ImportBatch.query
+
+    if viewer_role == 'applicant':
+        app_ids_for_user = [a.id for a in Application.query.filter_by(applicant_name=operator).all()]
+        if app_ids_for_user:
+            record_batch_ids = [r.batch_id for r in ImportRecord.query.filter(
+                ImportRecord.application_id.in_(app_ids_for_user)).all()]
+            query = query.filter(ImportBatch.id.in_(set(record_batch_ids)))
+        else:
+            query = query.filter(ImportBatch.id == -1)
 
     if status_filter:
         query = query.filter_by(status=status_filter)
@@ -1434,9 +1550,9 @@ def list_import_batches():
 
     result = []
     for b in batches:
-        batch_dict = b.to_dict()
+        batch_dict = b.to_dict(viewer_role=viewer_role)
 
-        if approval_status_filter:
+        if viewer_role == 'approver' and approval_status_filter:
             ab = batch_dict.get('approval_breakdown', {})
             if not ab.get(approval_status_filter, 0) > 0:
                 continue
@@ -1459,10 +1575,19 @@ def get_import_batch(batch_id):
     operator = request.args.get('operator', '').strip()
     if not operator:
         return jsonify({'error': '缺少操作人参数'}), 400
-    if not is_approver(operator):
-        add_audit_log(operator, 'import_view_denied', 'import_batch', batch_id,
-                      '无权限查看导入详情被拒绝', request.remote_addr)
-        return jsonify({'error': '无权查看导入详情，需审批人权限'}), 403
+
+    viewer_role = 'approver' if is_approver(operator) else 'applicant'
+
+    if viewer_role == 'applicant':
+        app_ids_for_user = [a.id for a in Application.query.filter_by(applicant_name=operator).all()]
+        record_in_batch = ImportRecord.query.filter(
+            ImportRecord.batch_id == batch_id,
+            ImportRecord.application_id.in_(app_ids_for_user)
+        ).first() if app_ids_for_user else None
+        if not record_in_batch:
+            add_audit_log(operator, 'import_view_denied', 'import_batch', batch_id,
+                          '申请人无权查看不相关的批次详情被拒绝', request.remote_addr)
+            return jsonify({'error': '无权查看该批次详情'}), 403
 
     batch = ImportBatch.query.get(batch_id)
     if not batch:
@@ -1472,7 +1597,12 @@ def get_import_batch(batch_id):
     error_category_filter = request.args.get('error_category', '').strip()
     approval_status_filter = request.args.get('approval_status', '').strip()
 
-    batch_dict = batch.to_dict(include_records=True, include_application_detail=True)
+    batch_dict = batch.to_dict(include_records=True, include_application_detail=True, viewer_role=viewer_role)
+
+    if viewer_role == 'applicant':
+        if app_ids_for_user:
+            batch_dict['records'] = [r for r in batch_dict.get('records', [])
+                                     if r.get('application_id') in app_ids_for_user]
 
     if record_filter or error_category_filter or approval_status_filter:
         filtered_records = []
@@ -1488,19 +1618,20 @@ def get_import_batch(batch_id):
             filtered_records.append(r)
         batch_dict['records'] = filtered_records
 
-    related_logs = AuditLog.query.filter(
-        AuditLog.target_type == 'import_batch',
-        AuditLog.target_id == batch_id
-    ).order_by(AuditLog.id.desc()).all()
-    batch_dict['related_audit_logs'] = [l.to_dict() for l in related_logs]
-
-    app_ids = [r.get('application_id') for r in batch_dict.get('records', []) if r.get('application_id')]
-    if app_ids:
-        app_logs = AuditLog.query.filter(
-            AuditLog.target_type == 'application',
-            AuditLog.target_id.in_(app_ids)
+    if viewer_role == 'approver':
+        related_logs = AuditLog.query.filter(
+            AuditLog.target_type == 'import_batch',
+            AuditLog.target_id == batch_id
         ).order_by(AuditLog.id.desc()).all()
-        batch_dict['related_application_logs'] = [l.to_dict() for l in app_logs]
+        batch_dict['related_audit_logs'] = [l.to_dict() for l in related_logs]
+
+        app_ids = [r.get('application_id') for r in batch_dict.get('records', []) if r.get('application_id')]
+        if app_ids:
+            app_logs = AuditLog.query.filter(
+                AuditLog.target_type == 'application',
+                AuditLog.target_id.in_(app_ids)
+            ).order_by(AuditLog.id.desc()).all()
+            batch_dict['related_application_logs'] = [l.to_dict() for l in app_logs]
 
     return jsonify(batch_dict)
 

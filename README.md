@@ -12,17 +12,32 @@
 - **历史链路**：每次状态变更都记录操作人、时间、原因，形成完整审计链
 - **操作日志**：全局审计日志，记录所有关键操作
 - **排期导出**：按日期导出 CSV 排期表
+- **批量导入**：CSV 批量导入排期数据，支持预演、确认、取消和完整复核
+- **角色分层**：审批人和普通申请人看到不同层级的字段，审批侧明细不会泄露给申请人
 
 ### 关键校验规则
 1. **创建时**：时段必须在场地营业时间内
 2. **审批时**：同场地同时段已确认的申请会拦截后者
 3. **审批时**：当日已确认数量不能超过日配额
 4. **撤销取消时**：重新检查时段冲突和日配额
+5. **重复导入时**：同一 CSV 文件重复上传会被预演阶段检测到冲突
+6. **已取消批次重复上传**：同一文件名 + 同一操作人对应的已取消批次再次上传会被拦截，判为历史重复，不能重新建单
 
 ### 权限规则
-- **审批人**：可以审批通过/驳回、撤销取消、取消任意申请
-- **普通申请人**：只能提交申请、取消自己的申请，不能审批
+- **审批人**：可以审批通过/驳回、撤销取消、取消任意申请、上传/确认/取消导入批次、查看完整批次摘要和审批明细、导出批次复核 CSV
+- **普通申请人**：只能提交申请、取消自己的申请，查看自己的排期结果和必要状态，**不能**看到批次 ID、导入文件名、审批人、审批结论、失败分类等审批侧明细
 - 默认审批人名单：`张三`、`管理员`、`admin`、`Administrator`（可在 `app.py` 的 `APPROVERS` 中修改）
+
+### 角色分层字段规则
+
+| 接口 | 审批人可见 | 申请人可见 |
+|------|-----------|-----------|
+| 批次列表 `/api/import` | 批次ID、文件名、导入人、确认人、错误分类、审批状态聚合等全部字段 | 仅状态、成功/失败/总数、创建/更新时间 |
+| 批次详情 `/api/import/{id}` | 全部字段 + 操作日志 + 关联申请日志 | 仅自己相关的记录，且不含 batch_id、error_category、conflict_with_application_id 等；application 子对象仅含 id/status/status_label |
+| 排期视图 `/api/schedule/{date}` | 全部已确认申请字段 | 仅自己名下的已确认申请，且不含审批人、审批结论、冲突摘要等 |
+| 排期导出 `/api/schedule/{date}/export` | 含审批人、审批意见、冲突摘要、审批结论、导入批次ID、导入文件名等18列 | 仅日期、场地、活动名称、申请人、开始时间、结束时间、参与人数、状态8列 |
+| 申请列表 `/api/applications` | 全部字段 + 预检信息 | 不含审批人、审批结论、冲突摘要、审批意见、取消原因等 |
+| 我的排期 `/api/my-schedule` | 全部字段（审批人查自己） | 不含审批人、审批结论等审批侧明细 |
 
 ## 本地启动
 
@@ -72,6 +87,27 @@ python app.py
 8. **查看操作日志**：
    - 点击「操作日志」，可看到所有操作记录
 
+### 批量导入验证
+
+1. **上传 CSV**：在「批量导入」区域选择 CSV 文件，填写操作人（需为审批人），点击上传
+2. **查看预演结果**：上传后系统自动预演，显示通过/失败条数和失败原因分类
+3. **确认导入**：点击「确认导入」，系统正式写入申请数据
+4. **查看批次详情**：点击「查看详情」，可看到每条记录的导入状态、关联申请、错误分类
+5. **导出批次复核 CSV**：点击「导出CSV」，下载含完整审批状态和失败分类的复核表
+
+#### 已取消批次重复上传拦截
+
+1. 上传一个 CSV 文件，在预演阶段点击「取消」
+2. 再次上传同一文件名（同一操作人）→ 返回 409 错误：「属于历史重复，不能再重新建单」
+3. 换一个不同的文件名上传 → 不受影响，正常创建批次
+
+### 角色分层验证
+
+1. **申请人查看批次列表**：用非审批人身份调用 `/api/import?operator=李四`，返回的批次不含 ID、文件名、错误分类等审批侧字段
+2. **申请人查看批次详情**：用非审批人身份查看自己有关的批次详情，记录中不含 batch_id、error_category、conflict_with_application_id
+3. **申请人排期导出**：导出 CSV 仅含 8 列基本字段，不含审批人、审批结论等
+4. **审批人完整复核**：用审批人身份可查看全部字段，包括操作日志、失败分组、审批状态聚合
+
 ### 失败链路验证
 
 #### 1. 超出营业时段 → 不能创建
@@ -112,6 +148,9 @@ python app.py
    - 状态历史链路完整
    - 操作日志保留
    - 排期数据对得上
+   - 批次列表和详情与重启前一致
+   - 角色分层的字段过滤与重启前一致
+   - 排期导出 CSV 内容与重启前一致
 
 ## API 列表
 
@@ -122,30 +161,42 @@ python app.py
 | GET | `/api/venues/{id}` | 场地详情 |
 | PUT | `/api/venues/{id}` | 更新场地 |
 | DELETE | `/api/venues/{id}` | 删除/停用场地 |
-| GET | `/api/applications` | 申请列表（支持 venue_id/status/apply_date 过滤） |
+| GET | `/api/applications` | 申请列表（支持 venue_id/status/apply_date 过滤，按角色分层过滤字段） |
 | POST | `/api/applications` | 提交申请 |
 | GET | `/api/applications/{id}` | 申请详情（含历史） |
 | POST | `/api/applications/{id}/approve` | 审批通过 |
 | POST | `/api/applications/{id}/reject` | 审批驳回 |
 | POST | `/api/applications/{id}/cancel` | 取消申请 |
 | POST | `/api/applications/{id}/revoke` | 撤销取消 |
-| GET | `/api/schedule/{date}` | 当日排期视图 |
-| GET | `/api/schedule/{date}/export` | 导出当日排期 CSV |
+| GET | `/api/schedule/{date}` | 当日排期视图（按角色分层过滤字段和范围） |
+| GET | `/api/schedule/{date}/export` | 导出当日排期 CSV（审批人全量18列，申请人8列基本字段） |
 | GET | `/api/audit-logs` | 操作日志 |
 | GET | `/api/auth/info?name=xxx` | 查询指定用户是否为审批人 |
+| GET | `/api/my-schedule?operator=xxx` | 申请人查看自己的排期结果（按角色分层过滤字段） |
+| POST | `/api/import/upload` | 上传 CSV 并预演（需审批人权限，已取消批次重复上传返回 409） |
+| GET | `/api/import` | 导入批次列表（审批人看全量，申请人看自己相关且过滤审批侧字段） |
+| GET | `/api/import/{id}` | 导入批次详情（审批人含操作日志，申请人只看自己相关记录且过滤审批侧字段） |
+| POST | `/api/import/{id}/confirm` | 确认导入（需审批人权限） |
+| POST | `/api/import/{id}/cancel` | 取消导入批次（需审批人权限） |
+| POST | `/api/import/{id}/preview` | 重新预演（需审批人权限） |
+| GET | `/api/import/{id}/export` | 导出批次复核 CSV（需审批人权限） |
+| GET | `/api/import/{id}/records/{rid}/logs` | 单条记录操作日志（需审批人权限） |
 
 ## 项目结构
 
 ```
-├── app.py              # Flask 主应用，路由 + 业务逻辑
-├── models.py           # 数据模型（Venue/Application/StatusHistory/AuditLog）
-├── requirements.txt    # Python 依赖
-├── scheduling.db       # SQLite 数据库文件（首次启动生成）
+├── app.py                      # Flask 主应用，路由 + 业务逻辑
+├── models.py                   # 数据模型（Venue/Application/StatusHistory/AuditLog/ImportBatch/ImportRecord）
+├── requirements.txt            # Python 依赖
+├── scheduling.db               # SQLite 数据库文件（首次启动生成）
+├── test_process_http.py        # 真实进程级重启与HTTP接口测试（13个场景）
+├── test_polluted_scenario.py   # 污染场景测试
+├── test_regression.py          # 回归测试
 ├── templates/
-│   └── index.html      # 前端页面
+│   └── index.html              # 前端页面
 └── static/
-    ├── style.css       # 样式
-    └── app.js          # 前端逻辑
+    ├── style.css               # 样式
+    └── app.js                  # 前端逻辑
 ```
 
 ## 状态机
@@ -165,4 +216,38 @@ python app.py
   └─→ 之前的状态           [撤销取消，重校验]
 ```
 
+### 导入批次状态
+
+```
+预演中 (preview)
+  ├─→ 已确认待导入 (confirmed)  [审批人确认]
+  │     └─→ 已完成 (completed)  [正式导入执行]
+  └─→ 已取消 (cancelled)        [审批人取消]
+
+已取消 (cancelled)
+  └─→ 不可重新上传同文件名      [历史重复拦截]
+```
+
 每次状态变更都会写入 `status_history` 表，记录操作人、时间、原因。
+
+## 测试
+
+```bash
+# 运行完整进程级重启测试（13个场景，包含导入、导出、权限、跨重启回查四条验证链路）
+python test_process_http.py
+```
+
+测试场景覆盖：
+1. 同一 CSV 重复导入不生成重复申请
+2. 待审批列表含无效场地不 500
+3. 导入结果列表和详情回看
+4. 失败导入不留脏数据
+5. 真实进程重启后导出不重复
+6. 审批人完整回看 + 权限控制
+7. 重复导入批次差异
+8. 跨重启一致性
+9. 撤销/取消后批次视图同步变化
+10. **角色分层权限验证**（申请人字段过滤）
+11. **导出角色过滤验证**（审批人18列 vs 申请人8列）
+12. **已取消历史导入再次上传拦截**
+13. **跨重启角色一致性**（重启前后字段过滤一致）

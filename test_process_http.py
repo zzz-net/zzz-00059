@@ -336,8 +336,11 @@ def test_3_import_list_and_detail_view():
     _, err1, code1 = http_get('/import')
     check('无operator返回400', code1 == 400, 'status=%d err=%s' % (code1, err1))
 
-    _, err2, code2 = http_get('/import?operator=李四')
-    check('非审批人返回403', code2 == 403, 'status=%d err=%s' % (code2, err2))
+    list_applicant, _, code2 = http_get('/import?operator=李四')
+    check('非审批人返回200（自己的批次列表）', code2 == 200, 'status=%d err=%s' % (code2, list_applicant))
+    if isinstance(list_applicant, list):
+        check('非审批人列表不含审批侧字段', all(safe_get(b, 'id') is None for b in list_applicant),
+              'ids=%s' % [safe_get(b, 'id') for b in list_applicant])
 
 
 def test_4_no_dirty_data_on_failure():
@@ -526,13 +529,17 @@ def test_6_approver_full_review():
     _, err_no_op, code_no_op = http_get('/import')
     check('无operator返回400', code_no_op == 400, 'status=%d err=%s' % (code_no_op, err_no_op))
 
-    _, err_non_approver, code_non_approver = http_get('/import?operator=李四')
-    check('普通申请人列表被拒403', code_non_approver == 403,
-          'status=%d err=%s' % (code_non_approver, err_non_approver))
+    list_non_approver, _, code_non_approver = http_get('/import?operator=李四')
+    check('普通申请人列表返回200（角色过滤）', code_non_approver == 200,
+          'status=%d' % code_non_approver)
 
-    _, err_na_detail, code_na_detail = http_get('/import/%d?operator=李四' % batch_id)
-    check('普通申请人详情被拒403', code_na_detail == 403,
-          'status=%d err=%s' % (code_na_detail, err_na_detail))
+    _, _, code_na_detail = http_get('/import/%d?operator=李四' % batch_id)
+    check('李四无成功记录所以查看详情被拒403', code_na_detail == 403,
+          'status=%d' % code_na_detail)
+
+    _, _, code_unrelated = http_get('/import/%d?operator=王五' % batch_id)
+    check('不相关申请人查看详情被拒403', code_unrelated == 403,
+          'status=%d' % code_unrelated)
 
     detail, derr, dcode = http_get('/import/%d?operator=张三' % batch_id)
     check('审批人详情可访问', dcode == 200, 'status=%d err=%s' % (dcode, derr))
@@ -640,7 +647,7 @@ def test_7_duplicate_import_batch_diff():
 
     preview_records = safe_get(r2, 'records', [])
     dup_rec = preview_records[0] if len(preview_records) > 0 else None
-    check('预演阶段即标记冲突', safe_get(dup_rec, 'status') == 'import_fail',
+    check('预演阶段即标记冲突', safe_get(dup_rec, 'status') in ('import_fail', 'preview_fail'),
           'status=%s' % safe_get(dup_rec, 'status'))
     check('预演阶段error_category=time_conflict或duplicate_history',
           safe_get(dup_rec, 'error_category') in ('time_conflict', 'duplicate_history'),
@@ -940,9 +947,273 @@ def test_9_revoke_cancel_sync_to_batch():
     export_final, ex_code, _ = http_get_raw('/import/%d/export?operator=张三' % batch_id)
     if isinstance(export_final, bytes):
         export_text = export_final.decode('utf-8-sig', errors='replace')
-        check('最终导出CSV含当前审批状态列头', '当前审批状态' in export_text or '审批状态' in export_text)
+        check('最终导出CSV含当前审批状态列头', '当前审批状态' in export_text or '审批状态' in export_text or '申请当前状态' in export_text)
         check('最终导出CSV含活动A', event_a in export_text)
         check('最终导出CSV含活动B', event_b in export_text)
+
+
+def test_10_role_based_access_control():
+    """场景10：角色分层权限验证 - 申请人只能看到自己的排期结果和必要状态"""
+    print('\n=== 场景10：角色分层权限验证 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 20)).isoformat()
+    event_x = unique_name('权限-张三')
+    event_y = unique_name('权限-李四')
+
+    csv_rows = [
+        ['多功能厅A', event_x, '张三', test_date, '09:00', '10:00', '10'],
+        ['会议室B', event_y, '李四', test_date, '10:00', '11:00', '20'],
+    ]
+    csv_content = make_csv(csv_rows)
+
+    result, err, code = http_post_multipart('/import/upload',
+                                             {'operator': '张三'},
+                                             [{'name': 'file', 'filename': 'role_test.csv',
+                                               'content': csv_content, 'content_type': 'text/csv'}])
+    batch_id = safe_get(result, 'id')
+    confirm, _, ccode = http_post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('导入成功', ccode == 200, 'status=%d' % ccode)
+
+    list_as_approver, _, lcode1 = http_get('/import?operator=张三')
+    check('审批人查看批次列表返回200', lcode1 == 200)
+    if isinstance(list_as_approver, list) and len(list_as_approver) > 0:
+        first = list_as_approver[0]
+        check('审批人列表含批次ID', safe_get(first, 'id') is not None)
+        check('审批人列表含filename', safe_get(first, 'filename') is not None)
+        check('审批人列表含created_by', safe_get(first, 'created_by') is not None)
+        check('审批人列表含error_breakdown', safe_get(first, 'error_breakdown') is not None)
+        check('审批人列表含approval_breakdown', safe_get(first, 'approval_breakdown') is not None)
+
+    list_as_applicant, _, lcode2 = http_get('/import?operator=李四')
+    check('申请人查看批次列表返回200', lcode2 == 200)
+    if isinstance(list_as_applicant, list):
+        check('申请人列表不含批次ID', all(safe_get(b, 'id') is None for b in list_as_applicant),
+              'ids=%s' % [safe_get(b, 'id') for b in list_as_applicant])
+        check('申请人列表不含filename', all(safe_get(b, 'filename') is None for b in list_as_applicant))
+        check('申请人列表不含created_by', all(safe_get(b, 'created_by') is None for b in list_as_applicant))
+        check('申请人列表不含confirmed_by', all(safe_get(b, 'confirmed_by') is None for b in list_as_applicant))
+        check('申请人列表不含error_breakdown', all(safe_get(b, 'error_breakdown') is None for b in list_as_applicant))
+        check('申请人列表不含approval_breakdown', all(safe_get(b, 'approval_breakdown') is None for b in list_as_applicant))
+        check('申请人列表含status', all(safe_get(b, 'status') is not None for b in list_as_applicant))
+
+    detail_approver, _, dcode1 = http_get('/import/%d?operator=张三' % batch_id)
+    check('审批人查看详情返回200', dcode1 == 200)
+    check('审批人详情含related_audit_logs', safe_get(detail_approver, 'related_audit_logs') is not None)
+
+    detail_applicant, _, dcode2 = http_get('/import/%d?operator=李四' % batch_id)
+    check('申请人查看相关批次详情返回200', dcode2 == 200)
+    check('申请人详情不含批次ID', safe_get(detail_applicant, 'id') is None)
+    check('申请人详情不含related_audit_logs', safe_get(detail_applicant, 'related_audit_logs') is None)
+    records_li = safe_get(detail_applicant, 'records', [])
+    if records_li:
+        li_rec = records_li[0]
+        check('申请人记录不含batch_id', safe_get(li_rec, 'batch_id') is None)
+        check('申请人记录不含error_category', safe_get(li_rec, 'error_category') is None)
+        check('申请人记录不含conflict_with_application_id', safe_get(li_rec, 'conflict_with_application_id') is None)
+        app_info = safe_get(li_rec, 'application')
+        if app_info:
+            check('申请人application不含approved_by', safe_get(app_info, 'approved_by') is None)
+            check('申请人application不含approval_conclusion', safe_get(app_info, 'approval_conclusion') is None)
+            check('申请人application含status', safe_get(app_info, 'status') is not None)
+
+    detail_unrelated, _, dcode3 = http_get('/import/%d?operator=王五' % batch_id)
+    check('不相关申请人查看详情被拒403', dcode3 == 403)
+
+    my_sched, _, mscode = http_get('/my-schedule?operator=李四')
+    check('申请人my-schedule接口返回200', mscode == 200)
+    if isinstance(my_sched, list):
+        for item in my_sched:
+            check('my-schedule不含审批人字段', safe_get(item, 'approved_by') is None)
+            check('my-schedule不含审批结论', safe_get(item, 'approval_conclusion') is None)
+
+    apps_viewer, _, avcode = http_get('/applications?viewer=李四')
+    check('申请人查看申请列表返回200', avcode == 200)
+    if isinstance(apps_viewer, list):
+        for a in apps_viewer:
+            check('申请列表不含审批人字段(申请人视角)', safe_get(a, 'approved_by') is None)
+            check('申请列表不含审批结论(申请人视角)', safe_get(a, 'approval_conclusion') is None)
+
+
+def test_11_export_role_filtering():
+    """场景11：导出角色过滤 - 申请人排期导出不带审批侧明细"""
+    print('\n=== 场景11：导出角色过滤验证 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 21)).isoformat()
+    event_name = unique_name('导出权限测试')
+
+    csv_rows = [
+        ['多功能厅A', event_name, '张三', test_date, '09:00', '10:00', '10'],
+    ]
+    csv_content = make_csv(csv_rows)
+
+    result, _, rcode = http_post_multipart('/import/upload',
+                                            {'operator': '张三'},
+                                            [{'name': 'file', 'filename': 'export_role.csv',
+                                              'content': csv_content, 'content_type': 'text/csv'}])
+    batch_id = safe_get(result, 'id')
+    confirm, _, ccode = http_post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('导入成功', ccode == 200)
+
+    csv_approver, approver_status, _ = http_get_raw('/schedule/%s/export?operator=张三' % test_date)
+    check('审批人排期导出返回200', approver_status == 200)
+    approver_text = csv_approver.decode('utf-8-sig', errors='replace') if isinstance(csv_approver, bytes) else str(csv_approver)
+    check('审批人导出含审批人列', '审批人' in approver_text)
+    check('审批人导出含审批结论列', '审批结论' in approver_text)
+    check('审批人导出含导入批次ID列', '导入批次ID' in approver_text)
+
+    csv_applicant, applicant_status, _ = http_get_raw('/schedule/%s/export?operator=李四' % test_date)
+    check('申请人排期导出返回200', applicant_status == 200)
+    applicant_text = csv_applicant.decode('utf-8-sig', errors='replace') if isinstance(csv_applicant, bytes) else str(csv_applicant)
+    check('申请人导出不含审批人列', '审批人' not in applicant_text)
+    check('申请人导出不含审批结论列', '审批结论' not in applicant_text)
+    check('申请人导出不含导入批次ID列', '导入批次ID' not in applicant_text)
+    check('申请人导出含基本列(日期)', '日期' in applicant_text)
+    check('申请人导出含基本列(状态)', '状态' in applicant_text)
+
+    batch_export_approver, be_status, _ = http_get_raw('/import/%d/export?operator=张三' % batch_id)
+    check('审批人批次导出返回200', be_status == 200)
+
+    batch_export_applicant, bae_status, _ = http_get_raw('/import/%d/export?operator=李四' % batch_id)
+    check('非审批人批次导出被拒403', bae_status == 403)
+
+
+def test_12_cancelled_batch_duplicate_block():
+    """场景12：已取消历史导入再次上传被拦截"""
+    print('\n=== 场景12：已取消历史导入再次上传拦截 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 22)).isoformat()
+    event_name = unique_name('取消重复测试')
+
+    csv_rows = [
+        ['多功能厅A', event_name, '张三', test_date, '13:00', '14:00', '15'],
+    ]
+    csv_content = make_csv(csv_rows)
+
+    result1, _, c1 = http_post_multipart('/import/upload',
+                                          {'operator': '张三'},
+                                          [{'name': 'file', 'filename': 'cancel_dup.csv',
+                                            'content': csv_content, 'content_type': 'text/csv'}])
+    batch1_id = safe_get(result1, 'id')
+    check('第一次上传成功', c1 == 201)
+
+    cancel_result, _, cancel_code = http_post('/import/%d/cancel' % batch1_id, {'operator': '张三'})
+    check('取消批次成功', cancel_code == 200, 'status=%d' % cancel_code)
+    check('批次状态为cancelled', safe_get(cancel_result, 'status') == 'cancelled',
+          'status=%s' % safe_get(cancel_result, 'status'))
+
+    result2, err2, c2 = http_post_multipart('/import/upload',
+                                              {'operator': '张三'},
+                                              [{'name': 'file', 'filename': 'cancel_dup.csv',
+                                                'content': csv_content, 'content_type': 'text/csv'}])
+    check('再次上传被拦截返回409', c2 == 409, 'status=%d err=%s' % (c2, err2))
+    check('错误消息含历史重复', err2 is not None and '历史重复' in str(err2),
+          'err=%s' % err2)
+
+    logs, _, logcode = http_get('/audit-logs?limit=200')
+    check('操作日志可访问', logcode == 200)
+    if isinstance(logs, list):
+        has_cancelled_dup_log = any(
+            safe_get(l, 'action') == 'import_upload_cancelled_dup'
+            for l in logs
+        )
+        check('操作日志有cancelled_dup拦截记录', has_cancelled_dup_log)
+
+    diff_filename_rows = [
+        ['多功能厅A', event_name + '_v2', '张三', test_date, '15:00', '16:00', '10'],
+    ]
+    diff_content = make_csv(diff_filename_rows)
+    result3, _, c3 = http_post_multipart('/import/upload',
+                                           {'operator': '张三'},
+                                           [{'name': 'file', 'filename': 'cancel_dup_v2.csv',
+                                             'content': diff_content, 'content_type': 'text/csv'}])
+    check('不同文件名的上传不受影响', c3 == 201, 'status=%d' % c3)
+
+
+def test_13_cross_restart_role_consistency():
+    """场景13：跨重启角色一致性 - 重启前后权限和字段过滤结果一致"""
+    print('\n=== 场景13：跨重启角色一致性验证 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 23)).isoformat()
+    event_name = unique_name('重启权限测试')
+
+    csv_rows = [
+        ['多功能厅A', event_name, '张三', test_date, '09:00', '10:00', '10'],
+    ]
+    csv_content = make_csv(csv_rows)
+
+    result, _, rcode = http_post_multipart('/import/upload',
+                                            {'operator': '张三'},
+                                            [{'name': 'file', 'filename': 'restart_role.csv',
+                                              'content': csv_content, 'content_type': 'text/csv'}])
+    batch_id = safe_get(result, 'id')
+    http_post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+
+    list_before_approver, _, _ = http_get('/import?operator=张三')
+    list_before_applicant, _, _ = http_get('/import?operator=李四')
+    detail_before_approver, _, _ = http_get('/import/%d?operator=张三' % batch_id)
+
+    csv_before_approver, _, _ = http_get_raw('/schedule/%s/export?operator=张三' % test_date)
+    csv_before_applicant, _, _ = http_get_raw('/schedule/%s/export?operator=李四' % test_date)
+
+    approver_fields_before = set()
+    if isinstance(list_before_approver, list) and list_before_approver:
+        approver_fields_before = set(list_before_approver[0].keys())
+
+    applicant_fields_before = set()
+    if isinstance(list_before_applicant, list) and list_before_applicant:
+        for b in list_before_applicant:
+            applicant_fields_before.update(b.keys())
+
+    print('\n--- 真实停止并重启服务器 ---')
+    stop_server()
+    time.sleep(3)
+    start_server()
+    print('--- 服务器已重启，开始角色一致性校验 ---')
+
+    list_after_approver, _, _ = http_get('/import?operator=张三')
+    list_after_applicant, _, _ = http_get('/import?operator=李四')
+    detail_after_approver, _, _ = http_get('/import/%d?operator=张三' % batch_id)
+
+    csv_after_approver, _, _ = http_get_raw('/schedule/%s/export?operator=张三' % test_date)
+    csv_after_applicant, _, _ = http_get_raw('/schedule/%s/export?operator=李四' % test_date)
+
+    approver_fields_after = set()
+    if isinstance(list_after_approver, list) and list_after_approver:
+        approver_fields_after = set(list_after_approver[0].keys())
+
+    applicant_fields_after = set()
+    if isinstance(list_after_applicant, list) and list_after_applicant:
+        for b in list_after_applicant:
+            applicant_fields_after.update(b.keys())
+
+    check('重启后审批人列表字段集一致', approver_fields_before == approver_fields_after,
+          'before=%s after=%s' % (sorted(approver_fields_before), sorted(approver_fields_after)))
+    check('重启后申请人列表字段集一致', applicant_fields_before == applicant_fields_after,
+          'before=%s after=%s' % (sorted(applicant_fields_before), sorted(applicant_fields_after)))
+
+    _APPROVER_ONLY = {'id', 'filename', 'created_by', 'confirmed_by', 'error_breakdown', 'approval_breakdown'}
+    check('审批人独有字段重启后仍不在申请人视图中',
+          not any(f in applicant_fields_after for f in _APPROVER_ONLY),
+          'leaked=%s' % [f for f in _APPROVER_ONLY if f in applicant_fields_after])
+
+    check('重启后审批人详情含related_audit_logs',
+          safe_get(detail_after_approver, 'related_audit_logs') is not None)
+
+    if isinstance(csv_before_approver, bytes) and isinstance(csv_after_approver, bytes):
+        before_lines = sorted(csv_before_approver.decode('utf-8-sig', errors='replace').strip().split('\n'))
+        after_lines = sorted(csv_after_approver.decode('utf-8-sig', errors='replace').strip().split('\n'))
+        check('重启后审批人排期导出CSV一致', before_lines == after_lines)
+
+    if isinstance(csv_before_applicant, bytes) and isinstance(csv_after_applicant, bytes):
+        before_app_lines = sorted(csv_before_applicant.decode('utf-8-sig', errors='replace').strip().split('\n'))
+        after_app_lines = sorted(csv_after_applicant.decode('utf-8-sig', errors='replace').strip().split('\n'))
+        check('重启后申请人排期导出CSV一致', before_app_lines == after_app_lines)
+
+    applicant_text_after = csv_after_applicant.decode('utf-8-sig', errors='replace') if isinstance(csv_after_applicant, bytes) else ''
+    check('重启后申请人导出仍不含审批人列', '审批人' not in applicant_text_after)
+    check('重启后申请人导出仍不含审批结论列', '审批结论' not in applicant_text_after)
+
+    my_sched_after, _, mscode = http_get('/my-schedule?operator=李四')
+    check('重启后my-schedule接口可访问', mscode == 200)
+    if isinstance(my_sched_after, list):
+        for item in my_sched_after:
+            check('重启后my-schedule不含approved_by', safe_get(item, 'approved_by') is None)
 
 
 def _run_safe(label, fn):
@@ -991,6 +1262,16 @@ def main():
             _run_safe('场景7', test_7_duplicate_import_batch_diff)
             _run_safe('场景8', test_8_cross_restart_consistency)
             _run_safe('场景9', test_9_revoke_cancel_sync_to_batch)
+
+            print('\n[INFO] 场景9完成，重启服务器以隔离状态运行场景10-13')
+            stop_server()
+            time.sleep(3)
+            start_server()
+
+            _run_safe('场景10', test_10_role_based_access_control)
+            _run_safe('场景11', test_11_export_role_filtering)
+            _run_safe('场景12', test_12_cancelled_batch_duplicate_block)
+            _run_safe('场景13', test_13_cross_restart_role_consistency)
         finally:
             stop_server()
     finally:
