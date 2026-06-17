@@ -190,15 +190,22 @@ python app.py
 | POST | `/api/import/{id}/preview` | 重新预演（需审批人权限） |
 | GET | `/api/import/{id}/export` | 导出批次复核 CSV（需审批人权限） |
 | GET | `/api/import/{id}/records/{rid}/logs` | 单条记录操作日志（需审批人权限） |
+| GET | `/api/venue-closures` | 场地封场列表，支持 `venue_id/status/apply_date/viewer` 查询，按角色分层 |
+| GET | `/api/venue-closures/{id}` | 场地封场详情（审批人附带受影响申请列表 + 审计日志）|
+| POST | `/api/venue-closures` | 创建场地封场（审批人专属；必填 venue_id/起止日期时间/reason/affects_existing_applications）|
+| PUT | `/api/venue-closures/{id}` | 修改场地封场（审批人专属；仅 active 状态可修改）|
+| POST | `/api/venue-closures/{id}/revoke` | 撤销场地封场（审批人专属；设置 status=REVOKED 并记录撤销原因）|
+| DELETE | `/api/venue-closures/{id}` | 删除场地封场（审批人专属；物理删除）|
+| POST | `/api/venue-closures/{id}/delete` | 同 DELETE（兼容某些客户端不支持 DELETE 方法）|
 
 ## 项目结构
 
 ```
-├── app.py                      # Flask 主应用，路由 + 业务逻辑
-├── models.py                   # 数据模型（Venue/Application/StatusHistory/AuditLog/ImportBatch/ImportRecord）
+├── app.py                      # Flask 主应用，路由 + 业务逻辑（封场检测集成：create_application/validate_import_record/build_precheck/approve_application/revoke_cancellation）
+├── models.py                   # 数据模型（VenueClosure 新增 + Venue/Application/StatusHistory/AuditLog/ImportBatch/ImportRecord）
 ├── requirements.txt            # Python 依赖
-├── scheduling.db               # SQLite 数据库文件（首次启动生成）
-├── test_process_http.py        # 真实进程级重启与HTTP接口测试（13个场景）
+├── scheduling.db               # SQLite 数据库文件（首次启动生成，含 venue_closures 表）
+├── test_process_http.py        # 真实进程级重启与 HTTP 接口测试（17 个场景，场景14-17 验证封场四条链路）
 ├── test_polluted_scenario.py   # 污染场景测试
 ├── test_regression.py          # 回归测试
 ├── templates/

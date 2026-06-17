@@ -11,6 +11,34 @@ class VenueClosureStatus:
     REVOKED = 'revoked'
 
 
+class VenueClosureWaiver(db.Model):
+    __tablename__ = 'venue_closure_waivers'
+
+    id = db.Column(db.Integer, primary_key=True)
+    closure_id = db.Column(db.Integer, db.ForeignKey('venue_closures.id'), nullable=False)
+    application_id = db.Column(db.Integer, db.ForeignKey('applications.id'), nullable=False)
+
+    waived_by = db.Column(db.String(100), default='')
+    waived_at = db.Column(db.DateTime, default=datetime.utcnow)
+    waiver_reason = db.Column(db.Text, default='')
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    closure = db.relationship('VenueClosure', backref='waivers', lazy=True)
+    application = db.relationship('Application', backref='closure_waivers', lazy=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'closure_id': self.closure_id,
+            'application_id': self.application_id,
+            'waived_by': self.waived_by,
+            'waived_at': self.waived_at.isoformat() if self.waived_at else None,
+            'waiver_reason': self.waiver_reason,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class VenueClosure(db.Model):
     __tablename__ = 'venue_closures'
 

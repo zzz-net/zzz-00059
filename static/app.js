@@ -45,6 +45,8 @@ async function refreshRole() {
         const approvalPanel = document.getElementById('tab-approval');
         const importReviewBtns = document.querySelectorAll('.tab-btn[data-tab="importReview"]');
         const importReviewPanel = document.getElementById('tab-importReview');
+        const closureBtns = document.querySelectorAll('.tab-btn[data-tab="closures"]');
+        const closurePanel = document.getElementById('tab-closures');
         if (CURRENT_IS_APPROVER) {
             badge.textContent = '审批人';
             badge.className = 'status-badge status-confirmed';
@@ -53,17 +55,22 @@ async function refreshRole() {
             if (approvalPanel) approvalPanel.style.display = '';
             importReviewBtns.forEach(b => b.style.display = '');
             if (importReviewPanel) importReviewPanel.style.display = '';
+            closureBtns.forEach(b => b.style.display = '');
+            if (closurePanel) closurePanel.style.display = '';
         } else {
             badge.textContent = '普通申请人';
             badge.className = 'status-badge role-badge-applicant';
             hint.textContent = '（审批人: ' + APPROVER_LIST.join('、') + '）';
             approvalBtns.forEach(b => b.style.display = 'none');
             importReviewBtns.forEach(b => b.style.display = 'none');
+            closureBtns.forEach(b => b.style.display = 'none');
             const activeApprovalBtn = document.querySelector('.tab-btn.active[data-tab="approval"]');
             const activeImportReviewBtn = document.querySelector('.tab-btn.active[data-tab="importReview"]');
-            if (activeApprovalBtn || activeImportReviewBtn ||
+            const activeClosureBtn = document.querySelector('.tab-btn.active[data-tab="closures"]');
+            if (activeApprovalBtn || activeImportReviewBtn || activeClosureBtn ||
                 (approvalPanel && approvalPanel.classList.contains('active')) ||
-                (importReviewPanel && importReviewPanel.classList.contains('active'))) {
+                (importReviewPanel && importReviewPanel.classList.contains('active')) ||
+                (closurePanel && closurePanel.classList.contains('active'))) {
                 document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
                 document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
                 const firstBtn = document.querySelector('.tab-btn[data-tab="venues"]');
@@ -75,6 +82,7 @@ async function refreshRole() {
             }
             if (approvalPanel) approvalPanel.style.display = 'none';
             if (importReviewPanel) importReviewPanel.style.display = 'none';
+            if (closurePanel) closurePanel.style.display = 'none';
         }
 
         const activeTab = document.querySelector('.tab-btn.active');
@@ -84,6 +92,7 @@ async function refreshRole() {
             if (tab === 'applications') loadApplications();
             if (tab === 'approval') loadApprovalList();
             if (tab === 'importReview') loadImportBatches();
+            if (tab === 'closures') loadClosures();
             if (tab === 'schedule') loadSchedule();
             if (tab === 'logs') loadAuditLogs();
         }
@@ -144,6 +153,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
         if (tab === 'applications') loadApplications();
         if (tab === 'approval') loadApprovalList();
         if (tab === 'importReview') loadImportBatches();
+        if (tab === 'closures') loadClosures();
         if (tab === 'schedule') loadSchedule();
         if (tab === 'logs') loadAuditLogs();
     });
@@ -1011,6 +1021,7 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshRole().then(() => {
         loadVenues();
         loadApplications();
+        initClosureVenueFilter();
     });
 });
 
@@ -1019,3 +1030,312 @@ window.addEventListener('click', (e) => {
         e.target.classList.remove('show');
     }
 });
+
+const CLOSURE_STATUS_LABEL = {
+    'active': '生效中',
+    'revoked': '已撤销'
+};
+
+function loadClosures() {
+    if (!CURRENT_IS_APPROVER) return;
+
+    const statusFilter = document.getElementById('closureStatusFilter').value;
+    const venueFilter = document.getElementById('closureVenueFilter').value;
+    const op = encodeURIComponent(getOperator());
+
+    let url = '/venue-closures?viewer=' + op;
+    if (statusFilter) url += '&status=' + encodeURIComponent(statusFilter);
+    if (venueFilter) url += '&venue_id=' + venueFilter;
+
+    apiGet(url).then(closures => {
+        const container = document.getElementById('closureList');
+        if (closures.length === 0) {
+            container.innerHTML = '<div class="empty-state">暂无封场记录</div>';
+            return;
+        }
+        container.innerHTML = closures.map(c => renderClosureItem(c)).join('');
+    }).catch(err => alert(err.message));
+}
+
+function renderClosureItem(c) {
+    const timeRange = c.closure_start_time && c.closure_end_time
+        ? `${c.closure_start_time}-${c.closure_end_time}`
+        : '全天';
+    return `
+        <div class="import-batch-item">
+            <div class="info">
+                <div class="title-row">
+                    <h4>#${c.id} ${escapeHtml(c.venue_name || '')} 封场</h4>
+                    <span class="status-badge status-${c.status}">${CLOSURE_STATUS_LABEL[c.status] || c.status}</span>
+                </div>
+                <div class="subtitle">
+                    <span>📅 ${c.closure_start_date} ~ ${c.closure_end_date}</span>
+                    <span>🕐 ${timeRange}</span>
+                    <span>👤 创建人：${escapeHtml(c.created_by || '-')}</span>
+                </div>
+                <div class="import-stats">
+                    <span class="import-stat-item"><span class="label">原因</span><span class="value">${escapeHtml(c.reason || '未填写')}</span></span>
+                    <span class="import-stat-item"><span class="label">影响现有</span><span class="value">${c.affects_existing_applications ? '是' : '否'}</span></span>
+                    ${c.restore_note ? `<span class="import-stat-item"><span class="label">恢复备注</span><span class="value">${escapeHtml(c.restore_note)}</span></span>` : ''}
+                    ${c.revoked_by ? `<span class="import-stat-item"><span class="label">撤销人</span><span class="value">${escapeHtml(c.revoked_by)}</span></span>` : ''}
+                </div>
+            </div>
+            <div class="actions">
+                <button class="btn btn-sm" onclick="showClosureDetail(${c.id})">详情</button>
+                ${c.status === 'active' ? `
+                    <button class="btn btn-sm btn-warning" onclick="editClosure(${c.id})">编辑</button>
+                    <button class="btn btn-sm btn-danger" onclick="revokeClosure(${c.id})">撤销</button>
+                ` : ''}
+            </div>
+        </div>
+    `;
+}
+
+function openClosureModal(closure) {
+    document.getElementById('closureModal').classList.add('show');
+    document.getElementById('closureForm').reset();
+    document.getElementById('closureId').value = '';
+    document.getElementById('closureModalTitle').textContent = '新增封场';
+    document.getElementById('closureAffectsExisting').checked = true;
+
+    apiGet('/venues').then(venues => {
+        const activeVenues = venues.filter(v => v.is_active);
+        const sel = document.getElementById('closureVenueId');
+        sel.innerHTML = activeVenues.map(v => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join('');
+        if (closure) {
+            document.getElementById('closureModalTitle').textContent = '编辑封场';
+            document.getElementById('closureId').value = closure.id;
+            document.getElementById('closureVenueId').value = closure.venue_id;
+            document.getElementById('closureStartDate').value = closure.closure_start_date;
+            document.getElementById('closureEndDate').value = closure.closure_end_date;
+            document.getElementById('closureStartTime').value = closure.closure_start_time || '';
+            document.getElementById('closureEndTime').value = closure.closure_end_time || '';
+            document.getElementById('closureReason').value = closure.reason || '';
+            document.getElementById('closureRestoreNote').value = closure.restore_note || '';
+            document.getElementById('closureAffectsExisting').checked = closure.affects_existing_applications;
+        }
+    }).catch(err => alert(err.message));
+}
+
+function closeClosureModal() {
+    document.getElementById('closureModal').classList.remove('show');
+}
+
+function editClosure(id) {
+    const op = encodeURIComponent(getOperator());
+    apiGet('/venue-closures/' + id + '?viewer=' + op).then(c => {
+        openClosureModal(c);
+    }).catch(err => alert(err.message));
+}
+
+function saveClosure(e) {
+    e.preventDefault();
+    const id = document.getElementById('closureId').value;
+    const data = {
+        venue_id: parseInt(document.getElementById('closureVenueId').value),
+        closure_start_date: document.getElementById('closureStartDate').value,
+        closure_end_date: document.getElementById('closureEndDate').value,
+        closure_start_time: document.getElementById('closureStartTime').value || null,
+        closure_end_time: document.getElementById('closureEndTime').value || null,
+        reason: document.getElementById('closureReason').value.trim(),
+        restore_note: document.getElementById('closureRestoreNote').value.trim(),
+        affects_existing_applications: document.getElementById('closureAffectsExisting').checked,
+        operator: getOperator()
+    };
+
+    const promise = id
+        ? apiPut('/venue-closures/' + id, data)
+        : apiPost('/venue-closures', data);
+
+    promise.then(() => {
+        closeClosureModal();
+        loadClosures();
+        loadSchedule();
+    }).catch(err => alert(err.message));
+}
+
+function revokeClosure(id) {
+    if (!confirm('确定要撤销这个封场吗？撤销后封场将不再生效。')) return;
+    const reason = prompt('请输入撤销原因（可选）：', '');
+    if (reason === null) return;
+
+    const op = encodeURIComponent(getOperator());
+    apiPost('/venue-closures/' + id + '/revoke', {
+        operator: getOperator(),
+        revoke_reason: reason.trim()
+    }).then(() => {
+        loadClosures();
+        loadSchedule();
+    }).catch(err => alert('撤销失败：' + err.message));
+}
+
+function showClosureDetail(id) {
+    const op = encodeURIComponent(getOperator());
+    apiGet('/venue-closures/' + id + '?viewer=' + op).then(closure => {
+        renderClosureDetailContent(closure);
+        document.getElementById('closureDetailTitle').textContent =
+            `封场详情 #${closure.id} - ${closure.venue_name || ''}`;
+        document.getElementById('closureDetailModal').classList.add('show');
+    }).catch(err => alert(err.message));
+}
+
+function closeClosureDetailModal() {
+    document.getElementById('closureDetailModal').classList.remove('show');
+}
+
+function renderClosureDetailContent(closure) {
+    const timeRange = closure.closure_start_time && closure.closure_end_time
+        ? `${closure.closure_start_time}-${closure.closure_end_time}`
+        : '全天';
+    const affectedApps = closure.affected_applications || [];
+    const waivers = closure.waivers || [];
+    const auditLogs = closure.audit_logs || [];
+
+    const content = `
+        <div class="detail-section">
+            <h4>基本信息</h4>
+            <div class="detail-grid">
+                <div class="label">场地</div><div class="value">${escapeHtml(closure.venue_name || '-')}</div>
+                <div class="label">状态</div><div class="value"><span class="status-badge status-${closure.status}">${CLOSURE_STATUS_LABEL[closure.status] || closure.status}</span></div>
+                <div class="label">开始日期</div><div class="value">${closure.closure_start_date}</div>
+                <div class="label">结束日期</div><div class="value">${closure.closure_end_date}</div>
+                <div class="label">封场时段</div><div class="value">${timeRange}</div>
+                <div class="label">影响现有申请</div><div class="value">${closure.affects_existing_applications ? '是' : '否'}</div>
+                <div class="label">创建人</div><div class="value">${escapeHtml(closure.created_by || '-')}</div>
+                <div class="label">创建时间</div><div class="value">${closure.created_at ? new Date(closure.created_at).toLocaleString('zh-CN') : '-'}</div>
+                <div class="label">封场原因</div><div class="value">${escapeHtml(closure.reason || '-')}</div>
+                <div class="label">恢复备注</div><div class="value">${escapeHtml(closure.restore_note || '-')}</div>
+                ${closure.revoked_by ? `
+                    <div class="label">撤销人</div><div class="value">${escapeHtml(closure.revoked_by)}</div>
+                    <div class="label">撤销时间</div><div class="value">${closure.revoked_at ? new Date(closure.revoked_at).toLocaleString('zh-CN') : '-'}</div>
+                    <div class="label">撤销原因</div><div class="value">${escapeHtml(closure.revoke_reason || '-')}</div>
+                ` : ''}
+            </div>
+        </div>
+
+        <div class="detail-section">
+            <div class="detail-actions">
+                ${closure.status === 'active' ? `
+                    <button class="btn btn-warning" onclick="editClosure(${closure.id}); closeClosureDetailModal();">编辑封场</button>
+                    <button class="btn btn-danger" onclick="revokeClosure(${closure.id}); closeClosureDetailModal();">撤销封场</button>
+                ` : ''}
+            </div>
+        </div>
+
+        <div class="detail-section">
+            <h4>受影响的申请（${affectedApps.length} 个）</h4>
+            ${affectedApps.length === 0
+                ? '<div class="empty-state" style="padding:20px;">暂无受影响的申请</div>'
+                : `<div class="list-container">
+                    ${affectedApps.map(a => `
+                        <div class="app-item">
+                            <div class="info">
+                                <div class="title-row">
+                                    <h4>#${a.id} ${escapeHtml(a.event_name)}</h4>
+                                    <span class="status-badge status-${a.status}">${STATUS_MAP[a.status] || a.status}</span>
+                                    ${a.has_waiver ? '<span class="status-badge status-confirmed">已放行</span>' : ''}
+                                </div>
+                                <div class="subtitle">
+                                    <span>📅 ${a.apply_date}</span>
+                                    <span>🕐 ${a.start_time}-${a.end_time}</span>
+                                    <span>👤 ${escapeHtml(a.applicant_name)}</span>
+                                </div>
+                            </div>
+                            <div class="actions">
+                                <button class="btn btn-sm" onclick="showAppDetail(${a.id}); closeClosureDetailModal();">查看申请</button>
+                                ${closure.status === 'active' && !a.has_waiver ? `
+                                    <button class="btn btn-sm btn-success" onclick="grantWaiver(${closure.id}, ${a.id})">放行</button>
+                                ` : ''}
+                                ${closure.status === 'active' && a.has_waiver && a.waiver ? `
+                                    <button class="btn btn-sm btn-danger" onclick="revokeWaiver(${closure.id}, ${a.waiver.id})">撤销放行</button>
+                                ` : ''}
+                            </div>
+                        </div>
+                    `).join('')}
+                   </div>`
+            }
+        </div>
+
+        <div class="detail-section">
+            <h4>放行记录（${waivers.length} 条）</h4>
+            ${waivers.length === 0
+                ? '<div class="empty-state" style="padding:20px;">暂无放行记录</div>'
+                : `<div class="list-container">
+                    ${waivers.map(w => `
+                        <div class="import-record-item success">
+                            <div class="import-record-header">
+                                <div class="import-record-title">
+                                    <span>放行 #${w.id}</span>
+                                    <span class="status-badge status-confirmed">已放行</span>
+                                </div>
+                            </div>
+                            <div class="import-record-meta">
+                                <span>📋 申请 #${w.application_id}</span>
+                                <span>👤 放行人：${escapeHtml(w.waived_by || '-')}</span>
+                                <span>🕐 ${w.waived_at ? new Date(w.waived_at).toLocaleString('zh-CN') : '-'}</span>
+                            </div>
+                            ${w.waiver_reason ? `<div class="import-record-error" style="background:#ecfdf5;color:#065f46;">📝 ${escapeHtml(w.waiver_reason)}</div>` : ''}
+                            ${closure.status === 'active' ? `
+                                <div class="import-record-actions">
+                                    <button class="btn btn-sm btn-danger" onclick="revokeWaiver(${closure.id}, ${w.id})">撤销放行</button>
+                                </div>
+                            ` : ''}
+                        </div>
+                    `).join('')}
+                   </div>`
+            }
+        </div>
+
+        <div class="detail-section">
+            <h4>操作日志（${auditLogs.length} 条）</h4>
+            <div class="audit-log-section">
+                ${auditLogs.length === 0 ? '<div class="empty-state" style="padding:20px;">暂无日志</div>' :
+                    auditLogs.map(l => `
+                        <div class="log-item">
+                            <span class="log-time">${new Date(l.created_at).toLocaleString('zh-CN')}</span>
+                            <span class="log-actor">${escapeHtml(l.actor || '匿名')}</span>
+                            <span class="log-action">${escapeHtml(l.action)}</span>
+                            <span class="log-detail">${escapeHtml(l.detail || '')}</span>
+                        </div>
+                    `).join('')
+                }
+            </div>
+        </div>
+    `;
+    document.getElementById('closureDetailContent').innerHTML = content;
+}
+
+function grantWaiver(closureId, applicationId) {
+    const reason = prompt('请输入放行原因（可选）：', '');
+    if (reason === null) return;
+
+    apiPost('/venue-closures/' + closureId + '/waivers', {
+        operator: getOperator(),
+        application_id: applicationId,
+        waiver_reason: reason.trim()
+    }).then(() => {
+        showClosureDetail(closureId);
+        loadSchedule();
+    }).catch(err => alert('放行失败：' + err.message));
+}
+
+function revokeWaiver(closureId, waiverId) {
+    if (!confirm('确定要撤销这条放行记录吗？')) return;
+    const op = encodeURIComponent(getOperator());
+    apiDelete('/venue-closures/' + closureId + '/waivers/' + waiverId + '?operator=' + op)
+        .then(() => {
+            showClosureDetail(closureId);
+            loadSchedule();
+        }).catch(err => alert('撤销放行失败：' + err.message));
+}
+
+function initClosureVenueFilter() {
+    apiGet('/venues').then(venues => {
+        const sel = document.getElementById('closureVenueFilter');
+        if (sel) {
+            const activeVenues = venues.filter(v => v.is_active);
+            sel.innerHTML = '<option value="">全部场地</option>' +
+                activeVenues.map(v => `<option value="${v.id}">${escapeHtml(v.name)}</option>`).join('');
+        }
+    }).catch(() => {});
+}

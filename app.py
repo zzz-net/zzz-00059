@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify, render_template, Response, send_file
 from models import (db, Venue, Application, ApplicationStatus, StatusHistory, AuditLog,
                     ImportBatch, ImportBatchStatus, ImportRecord, ImportRecordStatus,
                     ImportRecordErrorCategory, ERROR_CATEGORY_LABEL,
-                    VenueClosure, VenueClosureStatus)
+                    VenueClosure, VenueClosureStatus, VenueClosureWaiver)
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
@@ -113,6 +113,23 @@ def _migrate_schema():
                         else:
                             col_t = 'VARCHAR(100) DEFAULT \'\''
                         conn.execute(text(f"ALTER TABLE venue_closures ADD COLUMN {c} {col_t}"))
+
+            rs4 = conn.execute(text("PRAGMA table_info(venue_closure_waivers)"))
+            cols4 = {row[1] for row in rs4.fetchall()}
+            if not cols4:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS venue_closure_waivers (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        closure_id INTEGER NOT NULL,
+                        application_id INTEGER NOT NULL,
+                        waived_by VARCHAR(100) DEFAULT '',
+                        waived_at DATETIME,
+                        waiver_reason TEXT DEFAULT '',
+                        created_at DATETIME,
+                        FOREIGN KEY (closure_id) REFERENCES venue_closures(id),
+                        FOREIGN KEY (application_id) REFERENCES applications(id)
+                    )
+                """))
             conn.commit()
         finally:
             conn.close()
@@ -504,7 +521,7 @@ def check_pending_conflict(venue_id, apply_date, start_t, end_t, exclude_app_id=
     return None
 
 
-def find_active_venue_closure(venue_id, apply_date, start_t, end_t):
+def find_active_venue_closure(venue_id, apply_date, start_t, end_t, exclude_app_id=None):
     closures = VenueClosure.query.filter(
         VenueClosure.venue_id == venue_id,
         VenueClosure.status == VenueClosureStatus.ACTIVE,
@@ -513,8 +530,28 @@ def find_active_venue_closure(venue_id, apply_date, start_t, end_t):
     ).all()
     for c in closures:
         if c.covers_period(apply_date, start_t, end_t):
+            if exclude_app_id:
+                waived = VenueClosureWaiver.query.filter_by(
+                    closure_id=c.id,
+                    application_id=exclude_app_id
+                ).first()
+                if waived:
+                    continue
             return c
     return None
+
+
+def has_closure_waiver(closure_id, application_id):
+    return VenueClosureWaiver.query.filter_by(
+        closure_id=closure_id,
+        application_id=application_id
+    ).first() is not None
+
+
+def get_application_waivers(application_id):
+    return VenueClosureWaiver.query.filter_by(
+        application_id=application_id
+    ).order_by(VenueClosureWaiver.id.desc()).all()
 
 
 def list_active_venue_closures(venue_id=None, apply_date=None):
@@ -598,7 +635,8 @@ def build_precheck(application):
     issues = []
     expected = 'pass'
 
-    closure = find_active_venue_closure(venue_id, apply_date, start_t, end_t)
+    closure = find_active_venue_closure(venue_id, apply_date, start_t, end_t,
+                                        exclude_app_id=application.id)
     if closure:
         cs = closure.closure_start_time or time(0, 0)
         ce = closure.closure_end_time or time(23, 59)
@@ -688,6 +726,116 @@ def auth_info():
 def list_venues():
     venues = Venue.query.order_by(Venue.id.asc()).all()
     return jsonify([v.to_dict() for v in venues])
+
+
+@app.route('/api/venue-closures/<int:closure_id>/waivers', methods=['POST'])
+def create_closure_waiver(closure_id):
+    data = request.get_json() or {}
+    operator = data.get('operator', '').strip()
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'closure_waiver_create_denied', 'venue_closure', closure_id,
+                      '无权限创建封场放行被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
+    closure = VenueClosure.query.get(closure_id)
+    if not closure:
+        return jsonify({'error': '封场记录不存在'}), 404
+    if closure.status != VenueClosureStatus.ACTIVE:
+        return jsonify({'error': '仅生效中的封场可以放行'}), 400
+
+    application_id = data.get('application_id')
+    if not application_id:
+        return jsonify({'error': '缺少申请ID'}), 400
+
+    app = Application.query.get(application_id)
+    if not app:
+        return jsonify({'error': '申请不存在'}), 404
+
+    if app.venue_id != closure.venue_id:
+        return jsonify({'error': '申请与封场不属于同一场地'}), 400
+
+    if not closure.covers_period(app.apply_date, app.start_time, app.end_time):
+        return jsonify({'error': '该申请时段不在封场范围内，无需放行'}), 400
+
+    existing = VenueClosureWaiver.query.filter_by(
+        closure_id=closure_id,
+        application_id=application_id
+    ).first()
+    if existing:
+        return jsonify({'error': '该申请已存在放行记录'}), 409
+
+    waiver_reason = data.get('waiver_reason', '').strip()
+
+    waiver = VenueClosureWaiver(
+        closure_id=closure_id,
+        application_id=application_id,
+        waived_by=operator,
+        waiver_reason=waiver_reason,
+    )
+    db.session.add(waiver)
+    db.session.commit()
+
+    audit_detail = '封场放行：封场#%d 申请#%d (%s) 原因=%s' % (
+        closure_id, application_id, app.event_name, waiver_reason or '特殊情况放行'
+    )
+    add_audit_log(operator, 'create_closure_waiver', 'venue_closure', closure_id,
+                  audit_detail, request.remote_addr)
+    add_audit_log(operator, 'closure_waiver_granted', 'application', application_id,
+                  audit_detail, request.remote_addr)
+
+    return jsonify(waiver.to_dict()), 201
+
+
+@app.route('/api/venue-closures/<int:closure_id>/waivers/<int:waiver_id>', methods=['DELETE'])
+def revoke_closure_waiver(closure_id, waiver_id):
+    operator = request.args.get('operator', '').strip()
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'closure_waiver_revoke_denied', 'venue_closure', closure_id,
+                      '无权限撤销封场放行被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
+    waiver = VenueClosureWaiver.query.get(waiver_id)
+    if not waiver or waiver.closure_id != closure_id:
+        return jsonify({'error': '放行记录不存在'}), 404
+
+    app = Application.query.get(waiver.application_id)
+
+    db.session.delete(waiver)
+    db.session.commit()
+
+    audit_detail = '撤销封场放行：封场#%d 放行#%d 申请#%d' % (
+        closure_id, waiver_id, waiver.application_id
+    )
+    add_audit_log(operator, 'revoke_closure_waiver', 'venue_closure', closure_id,
+                  audit_detail, request.remote_addr)
+    if app:
+        add_audit_log(operator, 'closure_waiver_revoked', 'application', waiver.application_id,
+                      audit_detail, request.remote_addr)
+
+    return jsonify({'message': '放行记录已撤销'})
+
+
+@app.route('/api/applications/<int:app_id>/closure-waivers', methods=['GET'])
+def list_application_waivers(app_id):
+    viewer = request.args.get('viewer', '').strip()
+    ok, err_msg = require_approver(viewer)
+    if not ok:
+        return jsonify({'error': '无权查看放行记录，需审批人权限'}), 403
+
+    app = Application.query.get(app_id)
+    if not app:
+        return jsonify({'error': '申请不存在'}), 404
+
+    waivers = get_application_waivers(app_id)
+    result = []
+    for w in waivers:
+        w_dict = w.to_dict()
+        if w.closure:
+            w_dict['closure'] = w.closure.to_dict(viewer_role='approver')
+        result.append(w_dict)
+    return jsonify(result)
 
 
 @app.route('/api/venues', methods=['POST'])
@@ -819,6 +967,9 @@ def list_applications():
     if apply_date:
         query = query.filter_by(apply_date=parse_date_str(apply_date))
 
+    if viewer_role == 'applicant' and viewer:
+        query = query.filter(Application.applicant_name == viewer)
+
     _APPLICANT_STRIP = {
         'approved_by', 'approved_at', 'approval_comment',
         'cancel_reason', 'cancelled_by', 'precheck_result',
@@ -931,10 +1082,29 @@ def get_application(app_id):
     app = Application.query.get(app_id)
     if not app:
         return jsonify({'error': '申请不存在'}), 404
-    data = app.to_dict(include_history=True)
+
     viewer = request.args.get('viewer', '').strip()
+    viewer_role = 'approver' if is_approver(viewer) else 'applicant'
+
+    if viewer_role == 'applicant' and viewer and viewer.strip() != app.applicant_name.strip():
+        add_audit_log(viewer, 'view_application_denied', 'application', app_id,
+                      '普通身份试图查看他人申请被拒绝', request.remote_addr)
+        return jsonify({'error': '无权查看该申请详情'}), 403
+
+    data = app.to_dict(include_history=True)
+
+    if viewer_role == 'applicant':
+        _APPLICANT_DETAIL_STRIP = {
+            'approved_by', 'approved_at', 'approval_comment',
+            'cancel_reason', 'cancelled_by', 'precheck_result',
+            'conflict_summary', 'approval_conclusion',
+            'last_precheck_at', 'last_precheck_by', 'previous_status',
+        }
+        data = {k: v for k, v in data.items() if k not in _APPLICANT_DETAIL_STRIP}
+
     if is_approver(viewer) and app.status in (ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED):
         data['precheck'] = build_precheck(app)
+
     return jsonify(data)
 
 
@@ -1023,7 +1193,8 @@ def approve_application(app_id):
             'error': f'超出当日配额（已确认 {current_count} 场，配额 {app.venue.daily_quota} 场）'
         }), 409
 
-    closure = find_active_venue_closure(app.venue_id, app.apply_date, app.start_time, app.end_time)
+    closure = find_active_venue_closure(app.venue_id, app.apply_date, app.start_time, app.end_time,
+                                        exclude_app_id=app.id)
     if closure and closure.affects_existing_applications:
         cs = closure.closure_start_time or time(0, 0)
         ce = closure.closure_end_time or time(23, 59)
@@ -1189,7 +1360,8 @@ def revoke_cancellation(app_id):
                 'error': f'撤销失败：超出当日配额（已确认 {current_count} 场，配额 {app.venue.daily_quota} 场）'
             }), 409
 
-        closure = find_active_venue_closure(app.venue_id, app.apply_date, app.start_time, app.end_time)
+        closure = find_active_venue_closure(app.venue_id, app.apply_date, app.start_time, app.end_time,
+                                            exclude_app_id=app.id)
         if closure and closure.affects_existing_applications:
             cs = closure.closure_start_time or time(0, 0)
             ce = closure.closure_end_time or time(23, 59)
@@ -1254,7 +1426,7 @@ def get_schedule(date_str):
             'applications': []
         }
         closures_for_venue = active_closures_by_venue.get(v.id, [])
-        if closures_for_venue:
+        if closures_for_venue and viewer_role == 'approver':
             venue_data['venue_closures'] = [c.to_dict(viewer_role=viewer_role) for c in closures_for_venue]
             affected_app_ids = set()
             for c in closures_for_venue:
@@ -1262,7 +1434,8 @@ def get_schedule(date_str):
                 ce = c.closure_end_time or time(23, 59)
                 for a in apps:
                     if c.covers_period(d, a.start_time, a.end_time):
-                        affected_app_ids.add(a.id)
+                        if not has_closure_waiver(c.id, a.id):
+                            affected_app_ids.add(a.id)
             venue_data['closure_affected_application_ids'] = sorted(list(affected_app_ids))
 
         for a in apps:
@@ -1275,26 +1448,35 @@ def get_schedule(date_str):
                     'last_precheck_at', 'last_precheck_by', 'previous_status',
                 }
                 ad = {k: v for k, v in ad.items() if k not in _SCHEDULE_APPLICANT_STRIP}
+            hit_closure = None
             for c in closures_for_venue:
                 if c.covers_period(d, a.start_time, a.end_time):
-                    ad['has_venue_closure'] = True
-                    ad['venue_closure_reason'] = c.reason or '场地维护'
-                    if viewer_role == 'approver':
-                        ad['venue_closure_id'] = c.id
-                        ad['closure_affects_existing'] = c.affects_existing_applications
-                    break
+                    waived = has_closure_waiver(c.id, a.id)
+                    if not waived:
+                        hit_closure = c
+                        break
+            if hit_closure:
+                ad['has_venue_closure'] = True
+                ad['venue_closure_reason'] = hit_closure.reason or '场地维护'
+                if viewer_role == 'approver':
+                    ad['venue_closure_id'] = hit_closure.id
+                    ad['closure_affects_existing'] = hit_closure.affects_existing_applications
             venue_data['applications'].append(ad)
         result.append(venue_data)
 
     all_closures_visible = []
-    for c in all_closures:
-        all_closures_visible.append(c.to_dict(viewer_role=viewer_role))
+    if viewer_role == 'approver':
+        for c in all_closures:
+            all_closures_visible.append(c.to_dict(viewer_role=viewer_role))
 
-    return jsonify({
+    response_data = {
         'date': d.isoformat(),
         'venues': result,
-        'venue_closures': all_closures_visible,
-    })
+    }
+    if viewer_role == 'approver':
+        response_data['venue_closures'] = all_closures_visible
+
+    return jsonify(response_data)
 
 
 STATUS_EXPORT_LABEL = {
@@ -1395,8 +1577,10 @@ def export_schedule(date_str):
         closures_for_venue = active_closures_by_venue.get(v.id, [])
         for c in closures_for_venue:
             if c.covers_period(d, a.start_time, a.end_time):
-                hit_closure = c
-                break
+                waived = has_closure_waiver(c.id, a.id)
+                if not waived:
+                    hit_closure = c
+                    break
         if hit_closure:
             cs = hit_closure.closure_start_time or time(0, 0)
             ce = hit_closure.closure_end_time or time(23, 59)
@@ -1983,7 +2167,12 @@ def get_application_history(app_id):
 @app.route('/api/venue-closures', methods=['GET'])
 def list_venue_closures():
     viewer = request.args.get('viewer', '').strip()
-    viewer_role = 'approver' if is_approver(viewer) else 'applicant'
+    ok, err_msg = require_approver(viewer)
+    if not ok:
+        add_audit_log(viewer, 'closure_list_denied', 'venue_closure', None,
+                      '普通身份试图列出封场记录被拒绝', request.remote_addr)
+        return jsonify({'error': '无权查看封场列表，需审批人权限'}), 403
+
     venue_id = request.args.get('venue_id', type=int)
     status_filter = request.args.get('status', '').strip()
     apply_date = request.args.get('apply_date', '').strip()
@@ -2001,40 +2190,59 @@ def list_venue_closures():
         )
     closures = query.order_by(VenueClosure.closure_start_date.desc(),
                               VenueClosure.id.desc()).all()
-    return jsonify([c.to_dict(viewer_role=viewer_role) for c in closures])
+    return jsonify([c.to_dict(viewer_role='approver') for c in closures])
 
 
 @app.route('/api/venue-closures/<int:closure_id>', methods=['GET'])
 def get_venue_closure(closure_id):
     viewer = request.args.get('viewer', '').strip()
-    viewer_role = 'approver' if is_approver(viewer) else 'applicant'
+    ok, err_msg = require_approver(viewer)
+    if not ok:
+        add_audit_log(viewer, 'closure_view_denied', 'venue_closure', closure_id,
+                      '普通身份试图查看封场详情被拒绝', request.remote_addr)
+        return jsonify({'error': '无权查看封场详情，需审批人权限'}), 403
+
     closure = VenueClosure.query.get(closure_id)
     if not closure:
         return jsonify({'error': '封场记录不存在'}), 404
-    result = closure.to_dict(viewer_role=viewer_role)
-    if viewer_role == 'approver':
-        affected_apps = []
-        if closure.status == VenueClosureStatus.ACTIVE:
-            apps = Application.query.filter(
-                Application.venue_id == closure.venue_id,
-                Application.apply_date >= closure.closure_start_date,
-                Application.apply_date <= closure.closure_end_date,
-                Application.status.in_([ApplicationStatus.CONFIRMED,
-                                        ApplicationStatus.PENDING_APPROVAL,
-                                        ApplicationStatus.SUBMITTED]),
-            ).order_by(Application.apply_date.asc(),
-                       Application.start_time.asc()).all()
-            cs = closure.closure_start_time or time(0, 0)
-            ce = closure.closure_end_time or time(23, 59)
-            for a in apps:
-                if closure.covers_period(a.apply_date, a.start_time, a.end_time):
-                    affected_apps.append(_app_summary_dict(a))
-        result['affected_applications'] = affected_apps
-        related_logs = AuditLog.query.filter(
-            AuditLog.target_type == 'venue_closure',
-            AuditLog.target_id == closure_id,
-        ).order_by(AuditLog.id.desc()).all()
-        result['audit_logs'] = [l.to_dict() for l in related_logs]
+    result = closure.to_dict(viewer_role='approver')
+    affected_apps = []
+    if closure.status == VenueClosureStatus.ACTIVE:
+        apps = Application.query.filter(
+            Application.venue_id == closure.venue_id,
+            Application.apply_date >= closure.closure_start_date,
+            Application.apply_date <= closure.closure_end_date,
+            Application.status.in_([ApplicationStatus.CONFIRMED,
+                                    ApplicationStatus.PENDING_APPROVAL,
+                                    ApplicationStatus.SUBMITTED]),
+        ).order_by(Application.apply_date.asc(),
+                   Application.start_time.asc()).all()
+        cs = closure.closure_start_time or time(0, 0)
+        ce = closure.closure_end_time or time(23, 59)
+        for a in apps:
+            if closure.covers_period(a.apply_date, a.start_time, a.end_time):
+                app_dict = _app_summary_dict(a)
+                waived = has_closure_waiver(closure.id, a.id)
+                app_dict['has_waiver'] = waived
+                if waived:
+                    waiver = VenueClosureWaiver.query.filter_by(
+                        closure_id=closure.id,
+                        application_id=a.id
+                    ).first()
+                    app_dict['waiver'] = waiver.to_dict() if waiver else None
+                affected_apps.append(app_dict)
+    result['affected_applications'] = affected_apps
+    related_logs = AuditLog.query.filter(
+        AuditLog.target_type == 'venue_closure',
+        AuditLog.target_id == closure_id,
+    ).order_by(AuditLog.id.desc()).all()
+    result['audit_logs'] = [l.to_dict() for l in related_logs]
+
+    waivers = VenueClosureWaiver.query.filter_by(
+        closure_id=closure_id
+    ).order_by(VenueClosureWaiver.id.desc()).all()
+    result['waivers'] = [w.to_dict() for w in waivers]
+
     return jsonify(result)
 
 
