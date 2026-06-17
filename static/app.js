@@ -43,19 +43,27 @@ async function refreshRole() {
         const hint = document.getElementById('roleHint');
         const approvalBtns = document.querySelectorAll('.tab-btn[data-tab="approval"]');
         const approvalPanel = document.getElementById('tab-approval');
+        const importReviewBtns = document.querySelectorAll('.tab-btn[data-tab="importReview"]');
+        const importReviewPanel = document.getElementById('tab-importReview');
         if (CURRENT_IS_APPROVER) {
             badge.textContent = '审批人';
             badge.className = 'status-badge status-confirmed';
             hint.textContent = '';
             approvalBtns.forEach(b => b.style.display = '');
             if (approvalPanel) approvalPanel.style.display = '';
+            importReviewBtns.forEach(b => b.style.display = '');
+            if (importReviewPanel) importReviewPanel.style.display = '';
         } else {
             badge.textContent = '普通申请人';
             badge.className = 'status-badge role-badge-applicant';
             hint.textContent = '（审批人: ' + APPROVER_LIST.join('、') + '）';
             approvalBtns.forEach(b => b.style.display = 'none');
+            importReviewBtns.forEach(b => b.style.display = 'none');
             const activeApprovalBtn = document.querySelector('.tab-btn.active[data-tab="approval"]');
-            if (activeApprovalBtn || (approvalPanel && approvalPanel.classList.contains('active'))) {
+            const activeImportReviewBtn = document.querySelector('.tab-btn.active[data-tab="importReview"]');
+            if (activeApprovalBtn || activeImportReviewBtn ||
+                (approvalPanel && approvalPanel.classList.contains('active')) ||
+                (importReviewPanel && importReviewPanel.classList.contains('active'))) {
                 document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
                 document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
                 const firstBtn = document.querySelector('.tab-btn[data-tab="venues"]');
@@ -66,6 +74,7 @@ async function refreshRole() {
                 return;
             }
             if (approvalPanel) approvalPanel.style.display = 'none';
+            if (importReviewPanel) importReviewPanel.style.display = 'none';
         }
 
         const activeTab = document.querySelector('.tab-btn.active');
@@ -74,6 +83,7 @@ async function refreshRole() {
             if (tab === 'venues') loadVenues();
             if (tab === 'applications') loadApplications();
             if (tab === 'approval') loadApprovalList();
+            if (tab === 'importReview') loadImportBatches();
             if (tab === 'schedule') loadSchedule();
             if (tab === 'logs') loadAuditLogs();
         }
@@ -133,6 +143,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
         if (tab === 'venues') loadVenues();
         if (tab === 'applications') loadApplications();
         if (tab === 'approval') loadApprovalList();
+        if (tab === 'importReview') loadImportBatches();
         if (tab === 'schedule') loadSchedule();
         if (tab === 'logs') loadAuditLogs();
     });
@@ -626,6 +637,374 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#039;');
+}
+
+const IMPORT_STATUS_LABEL = {
+    'preview': '预演中',
+    'confirmed': '已确认待导入',
+    'completed': '已完成',
+    'cancelled': '已取消',
+};
+
+const IMPORT_RECORD_STATUS_LABEL = {
+    'pending': '待处理',
+    'preview_pass': '预演通过',
+    'preview_fail': '预演失败',
+    'import_success': '导入成功',
+    'import_fail': '导入失败',
+    'duplicate_in_batch': '批内重复',
+};
+
+const ERROR_CATEGORY_LABEL_JS = {
+    'venue_not_found': '场地不存在',
+    'venue_inactive': '场地已停用',
+    'invalid_hours': '营业时间不合法',
+    'time_conflict': '时段冲突',
+    'quota_exceeded': '日配额超限',
+    'duplicate_history': '历史重复',
+    'duplicate_in_batch': '批内重复',
+    'validation_error': '校验错误',
+    'system_error': '系统异常',
+};
+
+function loadImportBatches() {
+    if (!CURRENT_IS_APPROVER) {
+        document.getElementById('importBatchList').innerHTML = '<div class="empty-state">无权访问，需审批人权限</div>';
+        return;
+    }
+    const batchStatus = document.getElementById('importBatchStatusFilter').value;
+    const approvalStatus = document.getElementById('importApprovalStatusFilter').value;
+    const importResult = document.getElementById('importResultFilter').value;
+    const op = encodeURIComponent(getOperator());
+    let url = '/import?operator=' + op;
+    if (batchStatus) url += '&batch_status=' + encodeURIComponent(batchStatus);
+    if (approvalStatus) url += '&approval_status=' + encodeURIComponent(approvalStatus);
+    if (importResult) url += '&import_result=' + encodeURIComponent(importResult);
+
+    apiGet(url).then(batches => {
+        const container = document.getElementById('importBatchList');
+        if (batches.length === 0) {
+            container.innerHTML = '<div class="empty-state">暂无导入批次</div>';
+            return;
+        }
+        container.innerHTML = batches.map(b => renderImportBatchItem(b)).join('');
+    }).catch(err => alert(err.message));
+}
+
+function renderImportBatchItem(b) {
+    const eb = b.error_breakdown || {};
+    const ab = b.approval_breakdown || {};
+    const ebParts = [];
+    if (eb.venue_not_found) ebParts.push(`场地不存在${eb.venue_not_found}`);
+    if (eb.venue_inactive) ebParts.push(`已停用${eb.venue_inactive}`);
+    if (eb.invalid_hours) ebParts.push(`营业时间${eb.invalid_hours}`);
+    if (eb.time_conflict) ebParts.push(`时段冲突${eb.time_conflict}`);
+    if (eb.quota_exceeded) ebParts.push(`配额超限${eb.quota_exceeded}`);
+    if (eb.duplicate_in_batch) ebParts.push(`批内重复${eb.duplicate_in_batch}`);
+    if (eb.duplicate_history) ebParts.push(`历史重复${eb.duplicate_history}`);
+    if (eb.validation_error) ebParts.push(`校验错误${eb.validation_error}`);
+    if (eb.system_error) ebParts.push(`系统异常${eb.system_error}`);
+
+    const abParts = [];
+    if (ab.pending_approval) abParts.push(`待审批${ab.pending_approval}`);
+    if (ab.confirmed) abParts.push(`已确认${ab.confirmed}`);
+    if (ab.cancelled) abParts.push(`已取消${ab.cancelled}`);
+    if (ab.rejected) abParts.push(`已驳回${ab.rejected}`);
+    if (ab.submitted) abParts.push(`已提交${ab.submitted}`);
+
+    return `
+        <div class="import-batch-item">
+            <div class="info">
+                <div class="title-row">
+                    <h4>#${b.id} ${escapeHtml(b.filename)}</h4>
+                    <span class="status-badge status-${b.status}">${IMPORT_STATUS_LABEL[b.status] || b.status}</span>
+                </div>
+                <div class="subtitle">
+                    <span>👤 导入人：${escapeHtml(b.created_by)}</span>
+                    <span>📅 创建：${new Date(b.created_at).toLocaleString('zh-CN')}</span>
+                    ${b.confirmed_by ? `<span>✅ 确认人：${escapeHtml(b.confirmed_by)}</span>` : ''}
+                </div>
+                <div class="import-stats">
+                    <span class="import-stat-item"><span class="label">总计</span><span class="value">${b.total_count}</span></span>
+                    <span class="import-stat-item"><span class="label">成功</span><span class="value success">${b.success_count}</span></span>
+                    <span class="import-stat-item"><span class="label">失败</span><span class="value fail">${b.failed_count}</span></span>
+                    ${abParts.length ? `<span class="import-stat-item"><span class="label">审批</span><span class="value warning">${abParts.join(' / ')}</span></span>` : ''}
+                    ${ebParts.length ? `<span class="import-stat-item"><span class="label">失败原因</span><span class="value fail">${ebParts.join(' / ')}</span></span>` : ''}
+                </div>
+            </div>
+            <div class="actions">
+                <button class="btn btn-sm" onclick="showImportBatchDetail(${b.id})">查看详情</button>
+                <button class="btn btn-sm btn-success" onclick="exportImportBatch(${b.id})">导出CSV</button>
+            </div>
+        </div>
+    `;
+}
+
+function showImportBatchDetail(batchId) {
+    const op = encodeURIComponent(getOperator());
+    apiGet('/import/' + batchId + '?operator=' + op).then(batch => {
+        document.getElementById('importBatchDetailTitle').textContent = `批次 #${batch.id} - ${batch.filename}`;
+        renderImportBatchDetailContent(batch);
+        document.getElementById('importBatchDetailModal').classList.add('show');
+    }).catch(err => alert(err.message));
+}
+
+function closeImportBatchDetailModal() {
+    document.getElementById('importBatchDetailModal').classList.remove('show');
+}
+
+function renderImportBatchDetailContent(batch) {
+    const eb = batch.error_breakdown || {};
+    const ab = batch.approval_breakdown || {};
+    const records = batch.records || [];
+
+    let recordsHtml = '';
+    if (records.length === 0) {
+        recordsHtml = '<div class="empty-state" style="padding:20px;">暂无记录</div>';
+    } else {
+        recordsHtml = records.map(r => renderImportRecordItem(batch.id, r)).join('');
+    }
+
+    const logs = batch.related_audit_logs || [];
+    const appLogs = batch.related_application_logs || [];
+    const allLogs = [...logs, ...appLogs].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    const content = `
+        <div class="detail-section">
+            <div class="batch-summary-card">
+                <h4>批次摘要</h4>
+                <div class="batch-summary-grid">
+                    <div class="batch-summary-cell"><div class="k">总记录</div><div class="v">${batch.total_count}</div></div>
+                    <div class="batch-summary-cell"><div class="k">导入成功</div><div class="v" style="color:#059669;">${batch.success_count}</div></div>
+                    <div class="batch-summary-cell"><div class="k">导入失败</div><div class="v" style="color:#dc2626;">${batch.failed_count}</div></div>
+                    <div class="batch-summary-cell"><div class="k">待审批</div><div class="v">${ab.pending_approval || 0}</div></div>
+                    <div class="batch-summary-cell"><div class="k">已确认</div><div class="v" style="color:#059669;">${ab.confirmed || 0}</div></div>
+                    <div class="batch-summary-cell"><div class="k">已取消</div><div class="v" style="color:#6b7280;">${ab.cancelled || 0}</div></div>
+                    <div class="batch-summary-cell"><div class="k">已驳回</div><div class="v" style="color:#dc2626;">${ab.rejected || 0}</div></div>
+                    <div class="batch-summary-cell"><div class="k">导入人</div><div class="v" style="font-size:13px;">${escapeHtml(batch.created_by)}</div></div>
+                </div>
+            </div>
+
+            <div class="detail-grid">
+                <div class="label">文件名</div><div class="value">${escapeHtml(batch.filename)}</div>
+                <div class="label">批次状态</div><div class="value"><span class="status-badge status-${batch.status}">${IMPORT_STATUS_LABEL[batch.status] || batch.status}</span></div>
+                <div class="label">创建时间</div><div class="value">${new Date(batch.created_at).toLocaleString('zh-CN')}</div>
+                ${batch.confirmed_by ? `<div class="label">确认人/时间</div><div class="value">${escapeHtml(batch.confirmed_by)} / ${batch.confirmed_at ? new Date(batch.confirmed_at).toLocaleString('zh-CN') : '-'}</div>` : ''}
+                <div class="label">预演摘要</div><div class="value">${escapeHtml(batch.preview_summary || '-')}</div>
+                ${batch.failure_summary ? `<div class="label">失败摘要</div><div class="value" style="color:#dc2626;">${escapeHtml(batch.failure_summary)}</div>` : ''}
+            </div>
+        </div>
+
+        <div class="detail-section">
+            <h4>导入记录明细（${records.length} 条）</h4>
+            <div class="import-detail-filter-bar">
+                <label style="font-size:13px;color:#6b7280;">筛选：</label>
+                <select id="detailRecordStatusFilter" onchange="filterImportBatchRecords(${batch.id})">
+                    <option value="">全部导入状态</option>
+                    <option value="import_success">仅导入成功</option>
+                    <option value="import_fail">仅导入失败</option>
+                    <option value="duplicate_in_batch">仅批内重复</option>
+                    <option value="preview_pass">仅预演通过</option>
+                    <option value="preview_fail">仅预演失败</option>
+                </select>
+                <select id="detailErrorCategoryFilter" onchange="filterImportBatchRecords(${batch.id})">
+                    <option value="">全部失败分类</option>
+                    <option value="venue_not_found">场地不存在</option>
+                    <option value="venue_inactive">场地已停用</option>
+                    <option value="invalid_hours">营业时间不合法</option>
+                    <option value="time_conflict">时段冲突</option>
+                    <option value="quota_exceeded">日配额超限</option>
+                    <option value="duplicate_in_batch">批内重复</option>
+                    <option value="duplicate_history">历史重复</option>
+                    <option value="validation_error">校验错误</option>
+                    <option value="system_error">系统异常</option>
+                </select>
+                <select id="detailApprovalStatusFilter" onchange="filterImportBatchRecords(${batch.id})">
+                    <option value="">全部审批状态</option>
+                    <option value="pending_approval">待审批</option>
+                    <option value="confirmed">已确认</option>
+                    <option value="cancelled">已取消</option>
+                    <option value="rejected">已驳回</option>
+                    <option value="submitted">已提交</option>
+                </select>
+                <button class="btn btn-sm btn-success" onclick="exportImportBatch(${batch.id})">📥 导出本批次</button>
+            </div>
+            <div id="importRecordsContainer">
+                ${recordsHtml}
+            </div>
+        </div>
+
+        <div class="detail-section">
+            <h4>相关操作日志（${allLogs.length} 条）</h4>
+            <div class="audit-log-section">
+                ${allLogs.length === 0 ? '<div class="empty-state" style="padding:20px;">暂无日志</div>' :
+                    allLogs.slice(0, 50).map(l => `
+                        <div class="log-item">
+                            <span class="log-time">${new Date(l.created_at).toLocaleString('zh-CN')}</span>
+                            <span class="log-actor">${escapeHtml(l.actor || '匿名')}</span>
+                            <span class="log-action">${escapeHtml(l.action)}</span>
+                            <span class="log-detail">${escapeHtml(l.detail || '')}</span>
+                        </div>
+                    `).join('')
+                }
+            </div>
+        </div>
+    `;
+    document.getElementById('importBatchDetailContent').innerHTML = content;
+}
+
+function filterImportBatchRecords(batchId) {
+    const recordStatus = document.getElementById('detailRecordStatusFilter').value;
+    const errorCategory = document.getElementById('detailErrorCategoryFilter').value;
+    const approvalStatus = document.getElementById('detailApprovalStatusFilter').value;
+    const op = encodeURIComponent(getOperator());
+    let url = '/import/' + batchId + '?operator=' + op;
+    if (recordStatus) url += '&record_status=' + encodeURIComponent(recordStatus);
+    if (errorCategory) url += '&error_category=' + encodeURIComponent(errorCategory);
+    if (approvalStatus) url += '&approval_status=' + encodeURIComponent(approvalStatus);
+
+    apiGet(url).then(batch => {
+        const records = batch.records || [];
+        const container = document.getElementById('importRecordsContainer');
+        if (records.length === 0) {
+            container.innerHTML = '<div class="empty-state" style="padding:20px;">筛选后无匹配记录</div>';
+        } else {
+            container.innerHTML = records.map(r => renderImportRecordItem(batchId, r)).join('');
+        }
+    }).catch(err => alert(err.message));
+}
+
+function renderImportRecordItem(batchId, r) {
+    let itemClass = '';
+    if (r.status === 'import_success' || r.status === 'preview_pass') itemClass = 'success';
+    else if (r.status === 'duplicate_in_batch') itemClass = 'duplicate';
+    else itemClass = 'fail';
+
+    const appInfo = r.application || null;
+    const conflictApp = r.conflict_application || null;
+
+    return `
+        <div class="import-record-item ${itemClass}">
+            <div class="import-record-header">
+                <div class="import-record-title">
+                    <span>第${r.line_number}行</span>
+                    <span class="status-badge status-${r.status}">${IMPORT_RECORD_STATUS_LABEL[r.status] || r.status}</span>
+                    ${r.error_category ? `<span class="error-category-badge ${r.error_category}">${ERROR_CATEGORY_LABEL_JS[r.error_category] || r.error_category}</span>` : ''}
+                    <span style="font-weight:500;">${escapeHtml(r.event_name)}</span>
+                </div>
+                <div class="import-record-actions">
+                    ${r.application_id ? `<button class="btn btn-sm btn-primary" onclick="showAppDetail(${r.application_id}); closeImportBatchDetailModal();">查看申请</button>` : ''}
+                    ${r.conflict_with_application_id ? `<button class="btn btn-sm btn-warning" onclick="showAppDetail(${r.conflict_with_application_id}); closeImportBatchDetailModal();">查看冲突申请</button>` : ''}
+                    ${r.application_id ? `<button class="btn btn-sm" onclick="showRecordLogs(${batchId}, ${r.id})">操作日志</button>` : ''}
+                </div>
+            </div>
+            <div class="import-record-meta">
+                <span>🏢 ${escapeHtml(r.venue_name)}${r.venue_id ? `(#${r.venue_id})` : ''}</span>
+                <span>👤 ${escapeHtml(r.applicant_name)}</span>
+                <span>📅 ${r.apply_date || '-'}</span>
+                <span>🕐 ${r.start_time || '-'} - ${r.end_time || '-'}</span>
+                <span>👥 ${r.participants}人</span>
+            </div>
+            ${appInfo ? `
+                <div class="import-record-app-info">
+                    <span>📋 关联申请 #${r.application_id}</span>
+                    <span class="status-badge status-${appInfo.status}">${appInfo.status_label || appInfo.status}</span>
+                    ${appInfo.approved_by ? `<span>✅ 审批人：${escapeHtml(appInfo.approved_by)}</span>` : ''}
+                    ${appInfo.approval_conclusion ? `<span>📝 ${escapeHtml(appInfo.approval_conclusion)}</span>` : ''}
+                    ${appInfo.cancelled_by ? `<span>❌ 取消人：${escapeHtml(appInfo.cancelled_by)}</span>` : ''}
+                </div>
+            ` : ''}
+            ${conflictApp ? `
+                <div class="import-record-error" style="background:#fff7ed;color:#92400e;">
+                    ⚠️ 与冲突申请 #${conflictApp.id}「${escapeHtml(conflictApp.event_name)}」重叠：${conflictApp.apply_date || ''} ${conflictApp.start_time || ''}-${conflictApp.end_time || ''}（${conflictApp.status_label || conflictApp.status}）
+                </div>
+            ` : ''}
+            ${r.error_message ? `<div class="import-record-error">❌ ${escapeHtml(r.error_message)}</div>` : ''}
+        </div>
+    `;
+}
+
+function showRecordLogs(batchId, recordId) {
+    const op = encodeURIComponent(getOperator());
+    apiGet(`/import/${batchId}/records/${recordId}/logs?operator=${op}`).then(data => {
+        const appLogs = data.application_logs || [];
+        const statusHistory = data.status_history || [];
+        const conflictApp = data.conflict_application || null;
+
+        let html = '<div class="detail-section">';
+
+        if (conflictApp) {
+            html += `<h4>冲突申请信息</h4>`;
+            html += `<div class="import-record-app-info">`;
+            html += `<span>📋 #${conflictApp.id} ${escapeHtml(conflictApp.event_name)}</span>`;
+            html += `<span class="status-badge status-${conflictApp.status}">${STATUS_MAP[conflictApp.status] || conflictApp.status}</span>`;
+            html += `<button class="btn btn-sm btn-primary" onclick="showAppDetail(${conflictApp.id}); document.getElementById('recordLogsModal').classList.remove('show'); closeImportBatchDetailModal();">查看详情</button>`;
+            html += `</div>`;
+        }
+
+        html += `<h4>状态历史（${statusHistory.length} 条）</h4>`;
+        if (statusHistory.length === 0) {
+            html += '<div class="empty-state" style="padding:10px;">暂无状态历史</div>';
+        } else {
+            html += '<div class="history-timeline">';
+            html += statusHistory.map(h => `
+                <div class="history-item">
+                    <div class="h-time">${new Date(h.created_at).toLocaleString('zh-CN')}</div>
+                    <div class="h-content">
+                        <div class="h-action">${ACTION_MAP[h.action] || h.action}：${h.from_status ? STATUS_MAP[h.from_status] + ' → ' : ''}${STATUS_MAP[h.to_status]}</div>
+                        <div class="h-meta">操作人：${escapeHtml(h.operator || '系统')}</div>
+                        ${h.comment ? '<div class="h-comment">' + escapeHtml(h.comment) + '</div>' : ''}
+                    </div>
+                </div>
+            `).join('');
+            html += '</div>';
+        }
+
+        html += `<h4 style="margin-top:16px;">操作日志（${appLogs.length} 条）</h4>`;
+        if (appLogs.length === 0) {
+            html += '<div class="empty-state" style="padding:10px;">暂无操作日志</div>';
+        } else {
+            html += '<div class="audit-log-section">';
+            html += appLogs.map(l => `
+                <div class="log-item">
+                    <span class="log-time">${new Date(l.created_at).toLocaleString('zh-CN')}</span>
+                    <span class="log-actor">${escapeHtml(l.actor || '匿名')}</span>
+                    <span class="log-action">${escapeHtml(l.action)}</span>
+                    <span class="log-detail">${escapeHtml(l.detail || '')}</span>
+                </div>
+            `).join('');
+            html += '</div>';
+        }
+
+        html += '</div>';
+
+        let modal = document.getElementById('recordLogsModal');
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'recordLogsModal';
+            modal.className = 'modal';
+            modal.innerHTML = `
+                <div class="modal-content modal-large">
+                    <div class="modal-header">
+                        <h3>记录操作日志</h3>
+                        <button class="close-btn" onclick="document.getElementById('recordLogsModal').classList.remove('show');">&times;</button>
+                    </div>
+                    <div id="recordLogsContent"></div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+            modal.addEventListener('click', (e) => {
+                if (e.target.classList.contains('modal')) e.target.classList.remove('show');
+            });
+        }
+        document.getElementById('recordLogsContent').innerHTML = html;
+        modal.classList.add('show');
+    }).catch(err => alert(err.message));
+}
+
+function exportImportBatch(batchId) {
+    const operator = encodeURIComponent(getOperator());
+    window.location.href = API + '/import/' + batchId + '/export?operator=' + operator;
 }
 
 document.addEventListener('DOMContentLoaded', () => {

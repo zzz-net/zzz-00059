@@ -202,7 +202,61 @@ class ImportBatch(db.Model):
     records = db.relationship('ImportRecord', backref='batch', lazy=True,
                               cascade='all, delete-orphan', order_by='ImportRecord.line_number')
 
-    def to_dict(self, include_records=False):
+    def to_dict(self, include_records=False, include_application_detail=False):
+        from collections import Counter
+
+        records_list = list(self.records)
+
+        venue_not_found = 0
+        venue_inactive = 0
+        invalid_hours = 0
+        time_conflict = 0
+        quota_exceeded = 0
+        duplicate_history = 0
+        duplicate_in_batch = 0
+        validation_error = 0
+        system_error = 0
+
+        approval_pending = 0
+        approval_confirmed = 0
+        approval_cancelled = 0
+        approval_rejected = 0
+        approval_submitted = 0
+
+        for r in records_list:
+            if r.error_category == ImportRecordErrorCategory.VENUE_NOT_FOUND:
+                venue_not_found += 1
+            elif r.error_category == ImportRecordErrorCategory.VENUE_INACTIVE:
+                venue_inactive += 1
+            elif r.error_category == ImportRecordErrorCategory.INVALID_HOURS:
+                invalid_hours += 1
+            elif r.error_category == ImportRecordErrorCategory.TIME_CONFLICT:
+                time_conflict += 1
+            elif r.error_category == ImportRecordErrorCategory.QUOTA_EXCEEDED:
+                quota_exceeded += 1
+            elif r.error_category == ImportRecordErrorCategory.DUPLICATE_HISTORY:
+                duplicate_history += 1
+            elif r.error_category == ImportRecordErrorCategory.DUPLICATE_IN_BATCH:
+                duplicate_in_batch += 1
+            elif r.error_category == ImportRecordErrorCategory.VALIDATION_ERROR:
+                validation_error += 1
+            elif r.error_category == ImportRecordErrorCategory.SYSTEM_ERROR:
+                system_error += 1
+
+            if r.application_id:
+                app = Application.query.get(r.application_id)
+                if app:
+                    if app.status == ApplicationStatus.PENDING_APPROVAL:
+                        approval_pending += 1
+                    elif app.status == ApplicationStatus.CONFIRMED:
+                        approval_confirmed += 1
+                    elif app.status == ApplicationStatus.CANCELLED:
+                        approval_cancelled += 1
+                    elif app.status == ApplicationStatus.REJECTED:
+                        approval_rejected += 1
+                    elif app.status == ApplicationStatus.SUBMITTED:
+                        approval_submitted += 1
+
         data = {
             'id': self.id,
             'filename': self.filename,
@@ -217,10 +271,53 @@ class ImportBatch(db.Model):
             'confirmed_at': self.confirmed_at.isoformat() if self.confirmed_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'error_breakdown': {
+                'venue_not_found': venue_not_found,
+                'venue_inactive': venue_inactive,
+                'invalid_hours': invalid_hours,
+                'time_conflict': time_conflict,
+                'quota_exceeded': quota_exceeded,
+                'duplicate_history': duplicate_history,
+                'duplicate_in_batch': duplicate_in_batch,
+                'validation_error': validation_error,
+                'system_error': system_error,
+            },
+            'approval_breakdown': {
+                'submitted': approval_submitted,
+                'pending_approval': approval_pending,
+                'confirmed': approval_confirmed,
+                'cancelled': approval_cancelled,
+                'rejected': approval_rejected,
+            },
         }
         if include_records:
-            data['records'] = [r.to_dict() for r in self.records]
+            data['records'] = [r.to_dict(include_application_detail=include_application_detail) for r in records_list]
         return data
+
+
+class ImportRecordErrorCategory:
+    VENUE_NOT_FOUND = 'venue_not_found'
+    VENUE_INACTIVE = 'venue_inactive'
+    INVALID_HOURS = 'invalid_hours'
+    TIME_CONFLICT = 'time_conflict'
+    QUOTA_EXCEEDED = 'quota_exceeded'
+    DUPLICATE_HISTORY = 'duplicate_history'
+    DUPLICATE_IN_BATCH = 'duplicate_in_batch'
+    VALIDATION_ERROR = 'validation_error'
+    SYSTEM_ERROR = 'system_error'
+
+
+ERROR_CATEGORY_LABEL = {
+    ImportRecordErrorCategory.VENUE_NOT_FOUND: '场地不存在',
+    ImportRecordErrorCategory.VENUE_INACTIVE: '场地已停用',
+    ImportRecordErrorCategory.INVALID_HOURS: '营业时间不合法',
+    ImportRecordErrorCategory.TIME_CONFLICT: '时段冲突',
+    ImportRecordErrorCategory.QUOTA_EXCEEDED: '日配额超限',
+    ImportRecordErrorCategory.DUPLICATE_HISTORY: '历史重复',
+    ImportRecordErrorCategory.DUPLICATE_IN_BATCH: '批内重复',
+    ImportRecordErrorCategory.VALIDATION_ERROR: '校验错误',
+    ImportRecordErrorCategory.SYSTEM_ERROR: '系统异常',
+}
 
 
 class ImportRecordStatus:
@@ -250,6 +347,8 @@ class ImportRecord(db.Model):
 
     status = db.Column(db.String(30), nullable=False, default=ImportRecordStatus.PENDING)
     error_message = db.Column(db.Text, default='')
+    error_category = db.Column(db.String(50), default='')
+    conflict_with_application_id = db.Column(db.Integer, default=None)
     application_id = db.Column(db.Integer, default=None)
 
     raw_data = db.Column(db.Text, default='')
@@ -257,8 +356,8 @@ class ImportRecord(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    def to_dict(self):
-        return {
+    def to_dict(self, include_application_detail=False):
+        data = {
             'id': self.id,
             'batch_id': self.batch_id,
             'line_number': self.line_number,
@@ -272,7 +371,48 @@ class ImportRecord(db.Model):
             'participants': self.participants,
             'status': self.status,
             'error_message': self.error_message,
+            'error_category': self.error_category,
+            'error_category_label': ERROR_CATEGORY_LABEL.get(self.error_category, ''),
+            'conflict_with_application_id': self.conflict_with_application_id,
             'application_id': self.application_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+        if include_application_detail and self.application_id:
+            app = Application.query.get(self.application_id)
+            if app:
+                data['application'] = {
+                    'id': app.id,
+                    'status': app.status,
+                    'status_label': {
+                        'submitted': '已提交',
+                        'pending_approval': '待审批',
+                        'confirmed': '已确认',
+                        'cancelled': '已取消',
+                        'rejected': '已驳回',
+                    }.get(app.status, app.status),
+                    'approved_by': app.approved_by,
+                    'approved_at': app.approved_at.isoformat() if app.approved_at else None,
+                    'cancelled_by': app.cancelled_by,
+                    'cancel_reason': app.cancel_reason,
+                    'approval_conclusion': app.approval_conclusion,
+                }
+        if include_application_detail and self.conflict_with_application_id:
+            conflict_app = Application.query.get(self.conflict_with_application_id)
+            if conflict_app:
+                data['conflict_application'] = {
+                    'id': conflict_app.id,
+                    'event_name': conflict_app.event_name,
+                    'status': conflict_app.status,
+                    'status_label': {
+                        'submitted': '已提交',
+                        'pending_approval': '待审批',
+                        'confirmed': '已确认',
+                        'cancelled': '已取消',
+                        'rejected': '已驳回',
+                    }.get(conflict_app.status, conflict_app.status),
+                    'apply_date': conflict_app.apply_date.isoformat() if conflict_app.apply_date else None,
+                    'start_time': conflict_app.start_time.strftime('%H:%M') if conflict_app.start_time else None,
+                    'end_time': conflict_app.end_time.strftime('%H:%M') if conflict_app.end_time else None,
+                }
+        return data

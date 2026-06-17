@@ -6,7 +6,8 @@ from datetime import datetime, time, timedelta, date
 from flask import Flask, request, jsonify, render_template, Response, send_file
 
 from models import (db, Venue, Application, ApplicationStatus, StatusHistory, AuditLog,
-                    ImportBatch, ImportBatchStatus, ImportRecord, ImportRecordStatus)
+                    ImportBatch, ImportBatchStatus, ImportRecord, ImportRecordStatus,
+                    ImportRecordErrorCategory, ERROR_CATEGORY_LABEL)
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
@@ -17,10 +18,26 @@ else:
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + _db_path
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JSON_AS_ASCII'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'connect_args': {'check_same_thread': False, 'timeout': 30},
+    'pool_pre_ping': True,
+}
+app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600
 
 APPROVERS = {'张三', '管理员', 'admin', 'Administrator'}
 
 db.init_app(app)
+
+if os.environ.get('TEST_MODE') == 'http_process':
+    import traceback
+
+    @app.errorhandler(Exception)
+    def handle_exception(e):
+        print('\n' + '=' * 80)
+        print('[SERVER ERROR] %s: %s' % (type(e).__name__, e))
+        traceback.print_exc()
+        print('=' * 80 + '\n')
+        return jsonify({'error': str(e)}), 500
 
 _db_initialized = False
 
@@ -40,6 +57,13 @@ def _migrate_schema():
             for c in missing:
                 col_type = 'DATETIME' if c.endswith('_at') else 'VARCHAR(200)' if c == 'approval_conclusion' else 'TEXT' if c == 'conflict_summary' else 'VARCHAR(30)' if c == 'precheck_result' else 'VARCHAR(100)'
                 conn.execute(text(f"ALTER TABLE applications ADD COLUMN {c} {col_type} DEFAULT ''"))
+
+            rs2 = conn.execute(text("PRAGMA table_info(import_records)"))
+            cols2 = {row[1] for row in rs2.fetchall()}
+            for c in ('error_category', 'conflict_with_application_id'):
+                if c not in cols2:
+                    col_type2 = 'INTEGER' if c == 'conflict_with_application_id' else 'VARCHAR(50)'
+                    conn.execute(text(f"ALTER TABLE import_records ADD COLUMN {c} {col_type2} DEFAULT ''"))
             conn.commit()
         finally:
             conn.close()
@@ -63,38 +87,49 @@ def _check_csv_duplicates_in_batch(records):
 
 def validate_import_record(record, venues_by_name, daily_usage_cache=None):
     errors = []
+    error_categories = []
     venue = None
+    conflict_application_id = None
 
     if not record.venue_name.strip():
         errors.append('场地名称不能为空')
+        error_categories.append(ImportRecordErrorCategory.VALIDATION_ERROR)
     else:
         venue = venues_by_name.get(record.venue_name.strip())
         if not venue:
             errors.append(f'场地「{record.venue_name}」不存在')
+            error_categories.append(ImportRecordErrorCategory.VENUE_NOT_FOUND)
         elif not venue.is_active:
             errors.append(f'场地「{record.venue_name}」已停用')
+            error_categories.append(ImportRecordErrorCategory.VENUE_INACTIVE)
         else:
             record.venue_id = venue.id
 
     if not record.event_name.strip():
         errors.append('活动名称不能为空')
+        error_categories.append(ImportRecordErrorCategory.VALIDATION_ERROR)
 
     if not record.applicant_name.strip():
         errors.append('申请人不能为空')
+        error_categories.append(ImportRecordErrorCategory.VALIDATION_ERROR)
 
     if not record.apply_date:
         errors.append('申请日期格式错误，应为 YYYY-MM-DD')
+        error_categories.append(ImportRecordErrorCategory.VALIDATION_ERROR)
 
     if not record.start_time or not record.end_time:
         errors.append('时间格式错误，应为 HH:MM')
+        error_categories.append(ImportRecordErrorCategory.VALIDATION_ERROR)
     else:
         if record.start_time >= record.end_time:
             errors.append('开始时间必须早于结束时间')
+            error_categories.append(ImportRecordErrorCategory.VALIDATION_ERROR)
 
     if venue and record.start_time and record.end_time and not errors:
         if not check_time_within_venue_hours(venue, record.start_time, record.end_time):
             errors.append(
                 f'申请时段超出场地营业时间（{venue.open_time.strftime("%H:%M")}-{venue.close_time.strftime("%H:%M")}）')
+            error_categories.append(ImportRecordErrorCategory.INVALID_HOURS)
 
     if venue and record.apply_date and record.start_time and record.end_time and not errors:
         conflict_app = check_pending_conflict(venue.id, record.apply_date,
@@ -103,14 +138,18 @@ def validate_import_record(record, venues_by_name, daily_usage_cache=None):
             status_text = '已确认' if conflict_app.status == ApplicationStatus.CONFIRMED else '待审批'
             errors.append(
                 f'时段冲突：与{status_text}申请 #{conflict_app.id}「{conflict_app.event_name}」时间重叠')
+            error_categories.append(ImportRecordErrorCategory.TIME_CONFLICT)
+            conflict_application_id = conflict_app.id
 
     if venue and record.apply_date and not errors:
         quota_ok, current_count = check_daily_quota(venue, record.apply_date)
         if not quota_ok:
             errors.append(
                 f'超出当日配额（已确认 {current_count} 场，配额 {venue.daily_quota} 场）')
+            error_categories.append(ImportRecordErrorCategory.QUOTA_EXCEEDED)
 
-    return errors, venue
+    primary_category = error_categories[0] if error_categories else ''
+    return errors, venue, primary_category, conflict_application_id
 
 
 def preview_import_batch(batch_id):
@@ -121,15 +160,20 @@ def preview_import_batch(batch_id):
     venues = Venue.query.all()
     venues_by_name = {v.name: v for v in venues}
 
-    records = batch.records
+    records = ImportRecord.query.filter_by(batch_id=batch_id).order_by(
+        ImportRecord.line_number).all()
 
     for idx, record in enumerate(records):
-        errors, venue = validate_import_record(record, venues_by_name)
+        errors, venue, error_category, conflict_app_id = validate_import_record(record, venues_by_name)
         if errors:
             record.status = ImportRecordStatus.PREVIEW_FAIL
             record.error_message = '；'.join(errors)
+            record.error_category = error_category
+            record.conflict_with_application_id = conflict_app_id
         else:
             record.status = ImportRecordStatus.PREVIEW_PASS
+            record.error_category = ''
+            record.conflict_with_application_id = None
 
     duplicates = _check_csv_duplicates_in_batch(records)
     duplicate_set = set()
@@ -139,9 +183,11 @@ def preview_import_batch(batch_id):
         if records[idx1].status == ImportRecordStatus.PREVIEW_PASS:
             records[idx1].status = ImportRecordStatus.DUPLICATE_IN_BATCH
             records[idx1].error_message = '与同文件内第 %d 行重复（同场地同时段）' % (records[idx2].line_number)
+            records[idx1].error_category = ImportRecordErrorCategory.DUPLICATE_IN_BATCH
         if records[idx2].status == ImportRecordStatus.PREVIEW_PASS:
             records[idx2].status = ImportRecordStatus.DUPLICATE_IN_BATCH
             records[idx2].error_message = '与同文件内第 %d 行重复（同场地同时段）' % (records[idx1].line_number)
+            records[idx2].error_category = ImportRecordErrorCategory.DUPLICATE_IN_BATCH
 
     preview_pass = sum(1 for r in records if r.status == ImportRecordStatus.PREVIEW_PASS)
     preview_fail = sum(1 for r in records if r.status in (ImportRecordStatus.PREVIEW_FAIL, ImportRecordStatus.DUPLICATE_IN_BATCH))
@@ -172,7 +218,9 @@ def execute_import_batch(batch_id, operator):
     failed_count = 0
     failure_details = []
 
-    for record in batch.records:
+    records_to_process = ImportRecord.query.filter_by(batch_id=batch_id).order_by(
+        ImportRecord.line_number).all()
+    for record in records_to_process:
         if record.status == ImportRecordStatus.IMPORT_SUCCESS:
             success_count += 1
             continue
@@ -184,10 +232,12 @@ def execute_import_batch(batch_id, operator):
             continue
 
         try:
-            errors, venue = validate_import_record(record, venues_by_name)
+            errors, venue, error_category, conflict_app_id = validate_import_record(record, venues_by_name)
             if errors:
                 record.status = ImportRecordStatus.IMPORT_FAIL
                 record.error_message = '；'.join(errors)
+                record.error_category = error_category
+                record.conflict_with_application_id = conflict_app_id
                 failed_count += 1
                 failure_details.append(f'第{record.line_number}行：{record.error_message}')
                 db.session.commit()
@@ -218,6 +268,8 @@ def execute_import_batch(batch_id, operator):
                 final_err = f'写入前兜底检测：与{status_text}申请 #{final_conflict.id}「{final_conflict.event_name}」时间重叠'
                 record.status = ImportRecordStatus.IMPORT_FAIL
                 record.error_message = final_err
+                record.error_category = ImportRecordErrorCategory.TIME_CONFLICT
+                record.conflict_with_application_id = final_conflict.id
                 failed_count += 1
                 failure_details.append(f'第{record.line_number}行：{final_err}')
                 db.session.commit()
@@ -236,6 +288,8 @@ def execute_import_batch(batch_id, operator):
 
             record.application_id = app.id
             record.status = ImportRecordStatus.IMPORT_SUCCESS
+            record.error_category = ''
+            record.conflict_with_application_id = None
             success_count += 1
 
             db.session.commit()
@@ -249,6 +303,7 @@ def execute_import_batch(batch_id, operator):
             db.session.rollback()
             record.status = ImportRecordStatus.IMPORT_FAIL
             record.error_message = f'导入异常：{str(e)}'
+            record.error_category = ImportRecordErrorCategory.SYSTEM_ERROR
             failed_count += 1
             failure_details.append(f'第{record.line_number}行：{record.error_message}')
             db.session.commit()
@@ -1034,6 +1089,31 @@ STATUS_EXPORT_LABEL = {
 }
 
 
+def _build_app_to_batch_map(app_ids):
+    if not app_ids:
+        return {}
+    records = ImportRecord.query.filter(
+        ImportRecord.application_id.in_(app_ids)
+    ).all()
+    batch_ids = [r.batch_id for r in records if r.batch_id]
+    batch_map = {}
+    if batch_ids:
+        batches = ImportBatch.query.filter(ImportBatch.id.in_(batch_ids)).all()
+        batch_map = {b.id: b for b in batches}
+    app_batch_map = {}
+    for r in records:
+        batch = batch_map.get(r.batch_id)
+        app_batch_map[r.application_id] = {
+            'batch_id': r.batch_id,
+            'batch_filename': batch.filename if batch else '',
+            'line_number': r.line_number,
+            'import_status': r.status,
+            'error_category': r.error_category,
+            'error_message': r.error_message,
+        }
+    return app_batch_map
+
+
 @app.route('/api/schedule/<date_str>/export', methods=['GET'])
 def export_schedule(date_str):
     try:
@@ -1041,47 +1121,194 @@ def export_schedule(date_str):
     except Exception:
         return jsonify({'error': '日期格式错误，应为 YYYY-MM-DD'}), 400
 
+    batch_id_filter = request.args.get('batch_id', type=int)
+    operator = request.args.get('operator', 'anonymous').strip()
+
     venues = Venue.query.filter_by(is_active=True).order_by(Venue.id.asc()).all()
 
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow([
         '日期', '场地', '活动名称', '申请人', '开始时间', '结束时间',
-        '参与人数', '状态', '审批人', '审批意见', '冲突摘要', '审批结论'
+        '参与人数', '状态', '审批人', '审批意见', '冲突摘要', '审批结论',
+        '导入批次ID', '导入文件名', 'CSV行号', '导入结果', '导入失败分类', '导入失败原因'
     ])
 
-    for v in venues:
-        apps = Application.query.filter(
-            Application.venue_id == v.id,
-            Application.apply_date == d,
-        ).order_by(Application.start_time.asc()).all()
+    apps_query = Application.query.filter(Application.apply_date == d)
 
+    if batch_id_filter:
+        import_records = ImportRecord.query.filter_by(batch_id=batch_id_filter).all()
+        filtered_app_ids = [r.application_id for r in import_records if r.application_id]
+        if filtered_app_ids:
+            apps_query = apps_query.filter(Application.id.in_(filtered_app_ids))
+        else:
+            apps_query = apps_query.filter(Application.id == -1)
+
+    all_apps = []
+    for v in venues:
+        apps = apps_query.filter(
+            Application.venue_id == v.id,
+        ).order_by(Application.start_time.asc()).all()
         for a in apps:
-            writer.writerow([
-                d.isoformat(),
-                v.name,
-                a.event_name,
-                a.applicant_name,
-                a.start_time.strftime('%H:%M'),
-                a.end_time.strftime('%H:%M'),
-                a.participants,
-                STATUS_EXPORT_LABEL.get(a.status, a.status),
-                a.approved_by or '',
-                a.approval_comment or '',
-                a.conflict_summary or '',
-                a.approval_conclusion or '',
-            ])
+            all_apps.append((v, a))
+
+    app_ids = [a.id for _, a in all_apps]
+    app_batch_map = _build_app_to_batch_map(app_ids)
+
+    for v, a in all_apps:
+        batch_info = app_batch_map.get(a.id, {})
+        writer.writerow([
+            d.isoformat(),
+            v.name,
+            a.event_name,
+            a.applicant_name,
+            a.start_time.strftime('%H:%M'),
+            a.end_time.strftime('%H:%M'),
+            a.participants,
+            STATUS_EXPORT_LABEL.get(a.status, a.status),
+            a.approved_by or '',
+            a.approval_comment or '',
+            a.conflict_summary or '',
+            a.approval_conclusion or '',
+            batch_info.get('batch_id', '') or '',
+            batch_info.get('batch_filename', '') or '',
+            batch_info.get('line_number', '') or '',
+            batch_info.get('import_status', '') or '',
+            ERROR_CATEGORY_LABEL.get(batch_info.get('error_category', ''), '') or '',
+            batch_info.get('error_message', '') or '',
+        ])
 
     csv_content = output.getvalue()
     output.close()
 
-    add_audit_log(request.args.get('operator', 'anonymous'), 'export_schedule', 'schedule', None,
-                  f'导出 {d.isoformat()} 排期表（含冲突摘要与审批结论）', request.remote_addr)
+    export_detail = f'导出 {d.isoformat()} 排期表（含冲突摘要、审批结论与批次摘要）'
+    if batch_id_filter:
+        export_detail += f'，按批次#{batch_id_filter}筛选'
+    add_audit_log(operator, 'export_schedule', 'schedule', None, export_detail, request.remote_addr)
+
+    filename = f'schedule_{d.isoformat()}'
+    if batch_id_filter:
+        filename += f'_batch{batch_id_filter}'
+    filename += '.csv'
 
     return Response(
         csv_content,
         mimetype='text/csv; charset=utf-8-sig',
-        headers={'Content-Disposition': f'attachment; filename=schedule_{d.isoformat()}.csv'}
+        headers={'Content-Disposition': f'attachment; filename={filename}'}
+    )
+
+
+@app.route('/api/import/<int:batch_id>/export', methods=['GET'])
+def export_import_batch(batch_id):
+    operator = request.args.get('operator', '').strip()
+    if not operator:
+        return jsonify({'error': '缺少操作人参数'}), 400
+    if not is_approver(operator):
+        add_audit_log(operator, 'export_batch_denied', 'import_batch', batch_id,
+                      '无权限导出批次被拒绝', request.remote_addr)
+        return jsonify({'error': '无权导出批次，需审批人权限'}), 403
+
+    try:
+        db.session.rollback()
+    except Exception:
+        pass
+
+    try:
+        batch = ImportBatch.query.get(batch_id)
+        if not batch:
+            return jsonify({'error': '批次不存在'}), 404
+
+        batch_filename = batch.filename
+        batch_id_val = batch.id
+        batch_total = batch.total_count
+
+        export_records = ImportRecord.query.filter_by(batch_id=batch_id).order_by(
+            ImportRecord.line_number).all()
+
+        records_data = []
+        for r in export_records:
+            records_data.append({
+                'line_number': r.line_number,
+                'venue_name': r.venue_name,
+                'event_name': r.event_name,
+                'applicant_name': r.applicant_name,
+                'apply_date': r.apply_date,
+                'start_time': r.start_time,
+                'end_time': r.end_time,
+                'participants': r.participants,
+                'status': r.status,
+                'error_category': r.error_category,
+                'error_message': r.error_message,
+                'application_id': r.application_id,
+                'conflict_with_application_id': r.conflict_with_application_id,
+            })
+
+        app_ids = [r['application_id'] for r in records_data if r['application_id']]
+        app_map = {}
+        if app_ids:
+            apps = Application.query.filter(Application.id.in_(app_ids)).all()
+            for a in apps:
+                app_map[a.id] = {
+                    'status': a.status,
+                    'approved_by': a.approved_by,
+                    'approval_conclusion': a.approval_conclusion,
+                }
+    finally:
+        try:
+            db.session.close()
+        except Exception:
+            pass
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        '批次ID', '文件名', 'CSV行号', '场地名称', '活动名称', '申请人',
+        '申请日期', '开始时间', '结束时间', '参与人数',
+        '导入状态', '导入失败分类', '导入失败原因',
+        '关联申请ID', '申请当前状态', '审批人', '审批结论', '冲突申请ID'
+    ])
+
+    for r in records_data:
+        app_status_label = ''
+        approved_by = ''
+        approval_conclusion = ''
+        if r['application_id'] and r['application_id'] in app_map:
+            app_info = app_map[r['application_id']]
+            app_status_label = STATUS_EXPORT_LABEL.get(app_info['status'], app_info['status'])
+            approved_by = app_info['approved_by'] or ''
+            approval_conclusion = app_info['approval_conclusion'] or ''
+
+        writer.writerow([
+            batch_id_val,
+            batch_filename,
+            r['line_number'],
+            r['venue_name'],
+            r['event_name'],
+            r['applicant_name'],
+            r['apply_date'].isoformat() if r['apply_date'] else '',
+            r['start_time'].strftime('%H:%M') if r['start_time'] else '',
+            r['end_time'].strftime('%H:%M') if r['end_time'] else '',
+            r['participants'],
+            r['status'],
+            ERROR_CATEGORY_LABEL.get(r['error_category'], '') or '',
+            r['error_message'] or '',
+            r['application_id'] or '',
+            app_status_label,
+            approved_by,
+            approval_conclusion,
+            r['conflict_with_application_id'] or '',
+        ])
+
+    csv_content = output.getvalue()
+    output.close()
+
+    add_audit_log(operator, 'export_import_batch', 'import_batch', batch_id,
+                  f'导出批次#{batch_id}复核详情，共{batch_total}条记录', request.remote_addr)
+
+    return Response(
+        csv_content,
+        mimetype='text/csv; charset=utf-8-sig',
+        headers={'Content-Disposition': f'attachment; filename=import_batch_{batch_id}.csv'}
     )
 
 
@@ -1194,8 +1421,37 @@ def list_import_batches():
                       '无权限查看导入列表被拒绝', request.remote_addr)
         return jsonify({'error': '无权查看导入列表，需审批人权限'}), 403
 
-    batches = ImportBatch.query.order_by(ImportBatch.id.desc()).all()
-    return jsonify([b.to_dict() for b in batches])
+    status_filter = request.args.get('batch_status', '').strip()
+    approval_status_filter = request.args.get('approval_status', '').strip()
+    result_filter = request.args.get('import_result', '').strip()
+
+    query = ImportBatch.query
+
+    if status_filter:
+        query = query.filter_by(status=status_filter)
+
+    batches = query.order_by(ImportBatch.id.desc()).all()
+
+    result = []
+    for b in batches:
+        batch_dict = b.to_dict()
+
+        if approval_status_filter:
+            ab = batch_dict.get('approval_breakdown', {})
+            if not ab.get(approval_status_filter, 0) > 0:
+                continue
+
+        if result_filter:
+            if result_filter == 'all_success' and batch_dict.get('failed_count', 0) > 0:
+                continue
+            if result_filter == 'has_failure' and batch_dict.get('failed_count', 0) == 0:
+                continue
+            if result_filter == 'all_failed' and batch_dict.get('success_count', 0) > 0:
+                continue
+
+        result.append(batch_dict)
+
+    return jsonify(result)
 
 
 @app.route('/api/import/<int:batch_id>', methods=['GET'])
@@ -1211,7 +1467,75 @@ def get_import_batch(batch_id):
     batch = ImportBatch.query.get(batch_id)
     if not batch:
         return jsonify({'error': '批次不存在'}), 404
-    return jsonify(batch.to_dict(include_records=True))
+
+    record_filter = request.args.get('record_status', '').strip()
+    error_category_filter = request.args.get('error_category', '').strip()
+    approval_status_filter = request.args.get('approval_status', '').strip()
+
+    batch_dict = batch.to_dict(include_records=True, include_application_detail=True)
+
+    if record_filter or error_category_filter or approval_status_filter:
+        filtered_records = []
+        for r in batch_dict.get('records', []):
+            if record_filter and r.get('status') != record_filter:
+                continue
+            if error_category_filter and r.get('error_category') != error_category_filter:
+                continue
+            if approval_status_filter:
+                app_info = r.get('application')
+                if not app_info or app_info.get('status') != approval_status_filter:
+                    continue
+            filtered_records.append(r)
+        batch_dict['records'] = filtered_records
+
+    related_logs = AuditLog.query.filter(
+        AuditLog.target_type == 'import_batch',
+        AuditLog.target_id == batch_id
+    ).order_by(AuditLog.id.desc()).all()
+    batch_dict['related_audit_logs'] = [l.to_dict() for l in related_logs]
+
+    app_ids = [r.get('application_id') for r in batch_dict.get('records', []) if r.get('application_id')]
+    if app_ids:
+        app_logs = AuditLog.query.filter(
+            AuditLog.target_type == 'application',
+            AuditLog.target_id.in_(app_ids)
+        ).order_by(AuditLog.id.desc()).all()
+        batch_dict['related_application_logs'] = [l.to_dict() for l in app_logs]
+
+    return jsonify(batch_dict)
+
+
+@app.route('/api/import/<int:batch_id>/records/<int:record_id>/logs', methods=['GET'])
+def get_import_record_logs(batch_id, record_id):
+    operator = request.args.get('operator', '').strip()
+    if not operator:
+        return jsonify({'error': '缺少操作人参数'}), 400
+    if not is_approver(operator):
+        return jsonify({'error': '无权查看，需审批人权限'}), 403
+
+    record = ImportRecord.query.get(record_id)
+    if not record or record.batch_id != batch_id:
+        return jsonify({'error': '记录不存在'}), 404
+
+    result = {}
+    if record.application_id:
+        app_logs = AuditLog.query.filter(
+            AuditLog.target_type == 'application',
+            AuditLog.target_id == record.application_id
+        ).order_by(AuditLog.id.desc()).all()
+        result['application_logs'] = [l.to_dict() for l in app_logs]
+
+        status_histories = StatusHistory.query.filter_by(
+            application_id=record.application_id
+        ).order_by(StatusHistory.id.desc()).all()
+        result['status_history'] = [h.to_dict() for h in status_histories]
+
+    if record.conflict_with_application_id:
+        conflict_app = Application.query.get(record.conflict_with_application_id)
+        if conflict_app:
+            result['conflict_application'] = conflict_app.to_dict(include_history=True)
+
+    return jsonify(result)
 
 
 @app.route('/api/import/<int:batch_id>/preview', methods=['POST'])
@@ -1229,7 +1553,9 @@ def repreview_import_batch(batch_id):
     if not batch:
         return jsonify({'error': '批次不存在'}), 404
 
-    for record in batch.records:
+    preview_records = ImportRecord.query.filter_by(batch_id=batch_id).order_by(
+        ImportRecord.line_number).all()
+    for record in preview_records:
         record.status = ImportRecordStatus.PENDING
         record.error_message = ''
 

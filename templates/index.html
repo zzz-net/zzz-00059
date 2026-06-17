@@ -22,6 +22,7 @@
             <button class="tab-btn active" data-tab="venues">场地管理</button>
             <button class="tab-btn" data-tab="applications">申请管理</button>
             <button class="tab-btn tab-approval" data-tab="approval" style="display:none;">审批面板</button>
+            <button class="tab-btn tab-import-review" data-tab="importReview" style="display:none;">导入批次复核</button>
             <button class="tab-btn" data-tab="schedule">排期视图</button>
             <button class="tab-btn" data-tab="logs">操作日志</button>
         </nav>
@@ -58,6 +59,36 @@
                     <h2>待审批申请</h2>
                 </div>
                 <div id="approvalList" class="list-container"></div>
+            </section>
+
+            <section id="tab-importReview" class="tab-panel">
+                <div class="panel-header">
+                    <h2>导入批次复核中心</h2>
+                    <div class="filter-bar">
+                        <select id="importBatchStatusFilter" onchange="loadImportBatches()">
+                            <option value="">全部批次状态</option>
+                            <option value="preview">预演中</option>
+                            <option value="confirmed">已确认待导入</option>
+                            <option value="completed">已完成</option>
+                            <option value="cancelled">已取消</option>
+                        </select>
+                        <select id="importApprovalStatusFilter" onchange="loadImportBatches()">
+                            <option value="">全部审批状态</option>
+                            <option value="pending_approval">待审批</option>
+                            <option value="confirmed">已确认</option>
+                            <option value="cancelled">已取消</option>
+                            <option value="rejected">已驳回</option>
+                        </select>
+                        <select id="importResultFilter" onchange="loadImportBatches()">
+                            <option value="">全部导入结果</option>
+                            <option value="all_success">全部成功</option>
+                            <option value="has_failure">含失败</option>
+                            <option value="all_failed">全部失败</option>
+                        </select>
+                        <button class="btn" onclick="loadImportBatches()">刷新</button>
+                    </div>
+                </div>
+                <div id="importBatchList" class="list-container"></div>
             </section>
 
             <section id="tab-schedule" class="tab-panel">
@@ -193,6 +224,16 @@
                 <button class="close-btn" onclick="closeDetailModal()">&times;</button>
             </div>
             <div id="detailContent"></div>
+        </div>
+    </div>
+
+    <div id="importBatchDetailModal" class="modal">
+        <div class="modal-content modal-extra-large">
+            <div class="modal-header">
+                <h3 id="importBatchDetailTitle">导入批次详情</h3>
+                <button class="close-btn" onclick="closeImportBatchDetailModal()">&times;</button>
+            </div>
+            <div id="importBatchDetailContent"></div>
         </div>
     </div>
 
