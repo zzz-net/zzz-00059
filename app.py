@@ -1800,8 +1800,27 @@ def my_schedule_results():
 
 @app.route('/api/audit-logs', methods=['GET'])
 def list_audit_logs():
+    viewer = request.args.get('viewer', '').strip()
+    ok, err_msg = require_approver(viewer)
+    if not ok:
+        add_audit_log(viewer, 'audit_log_list_denied', 'audit_log', None,
+                      '普通身份试图查看审计日志被拒绝', request.remote_addr)
+        return jsonify({'error': '无权查看审计日志，需审批人权限'}), 403
+
     limit = request.args.get('limit', 100, type=int)
-    logs = AuditLog.query.order_by(AuditLog.id.desc()).limit(limit).all()
+    target_type = request.args.get('target_type', '').strip()
+    target_id = request.args.get('target_id', type=int)
+    actor = request.args.get('actor', '').strip()
+
+    query = AuditLog.query
+    if target_type:
+        query = query.filter(AuditLog.target_type == target_type)
+    if target_id is not None:
+        query = query.filter(AuditLog.target_id == target_id)
+    if actor:
+        query = query.filter(AuditLog.actor == actor)
+
+    logs = query.order_by(AuditLog.id.desc()).limit(limit).all()
     return jsonify([l.to_dict() for l in logs])
 
 

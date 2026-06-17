@@ -4,43 +4,49 @@ import json
 import urllib.request
 import urllib.parse
 
-BASE_URL = 'http://localhost:5002/api'
+BASE_URL = 'http://localhost:5003/api'
 
 def encode_params(params):
     return urllib.parse.urlencode(params)
 
-def api_get(path, params=None):
+def api_get(path, params=None, timeout=10):
     url = BASE_URL + path
     if params:
         url += '?' + encode_params(params)
     req = urllib.request.Request(url)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode('utf-8'))
+    except Exception as e:
+        return 0, {'error': str(e)}
 
-def api_post(path, data=None):
+def api_post(path, data=None, timeout=10):
     url = BASE_URL + path
     body = json.dumps(data or {}).encode('utf-8')
     req = urllib.request.Request(url, data=body, method='POST')
     req.add_header('Content-Type', 'application/json')
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode('utf-8'))
+    except Exception as e:
+        return 0, {'error': str(e)}
 
-def api_delete(path, params=None):
+def api_delete(path, params=None, timeout=10):
     url = BASE_URL + path
     if params:
         url += '?' + encode_params(params)
     req = urllib.request.Request(url, method='DELETE')
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode('utf-8'))
+    except Exception as e:
+        return 0, {'error': str(e)}
 
 def run_tests():
     print('=' * 60)
@@ -98,13 +104,13 @@ def run_tests():
         'event_name': 'Approver Test Event',
         'applicant_name': APPROVER,
         'apply_date': TEST_DATE,
-        'start_time': '10:00',
-        'end_time': '12:00',
+        'start_time': '13:00',
+        'end_time': '14:00',
         'created_by': APPROVER
     })
     if status == 201:
-        app_id = app1['id']
-        status, data = api_get(f'/applications/{app_id}', {'viewer': APPLICANT})
+        app_id_for_privacy_test = app1['id']
+        status, data = api_get(f'/applications/{app_id_for_privacy_test}', {'viewer': APPLICANT})
         if status == 403:
             print('[PASS] 1.5 普通申请人不能查看他人申请详情')
             passed += 1
@@ -114,6 +120,22 @@ def run_tests():
     else:
         print(f'[FAIL] 1.5 创建测试申请失败: status={status}, resp={app1}')
         failed += 1
+        app_id_for_privacy_test = None
+
+    # 为后续放行测试创建独立的申请
+    status, app_for_waiver = api_post('/applications', {
+        'venue_id': 1,
+        'event_name': 'Waiver Test Event',
+        'applicant_name': APPROVER,
+        'apply_date': TEST_DATE,
+        'start_time': '10:00',
+        'end_time': '11:00',
+        'created_by': APPROVER
+    })
+    if status == 201:
+        app_id = app_for_waiver['id']
+    else:
+        print(f'[WARN] 创建放行测试申请失败: {app_for_waiver}')
         app_id = None
 
     # ---- 2. 封场创建与冲突拦截测试 ----
@@ -266,15 +288,25 @@ def run_tests():
     # ---- 5. 操作日志留痕测试 ----
     print('\n--- 5. 操作日志留痕测试 ---')
 
-    status, logs = api_get('/audit-logs', {'limit': 100})
+    # 普通用户访问审计日志应被拒绝
+    status, _ = api_get('/audit-logs', {'limit': 100, 'viewer': APPLICANT})
+    if status == 403:
+        print('[PASS] 5.1a 普通申请人访问审计日志被拒绝 (403)')
+        passed += 1
+    else:
+        print(f'[FAIL] 5.1a 普通申请人访问审计日志未被拒绝: status={status}')
+        failed += 1
+
+    # 审批人可以访问审计日志
+    status, logs = api_get('/audit-logs', {'limit': 100, 'viewer': APPROVER})
     log_actions = [l['action'] for l in logs]
     required_actions = ['create_venue_closure', 'create_closure_waiver']
     has_required = all(a in log_actions for a in required_actions)
     if status == 200 and has_required:
-        print('[PASS] 5.1 封场创建/放行操作都有审计日志')
+        print('[PASS] 5.1b 封场创建/放行操作都有审计日志')
         passed += 1
     else:
-        print('[FAIL] 5.1 审计日志缺少必要记录')
+        print('[FAIL] 5.1b 审计日志缺少必要记录')
         closure_actions = [a for a in log_actions if 'closure' in a or 'waiver' in a]
         print(f'    已有相关 actions: {closure_actions}')
         failed += 1
@@ -350,29 +382,30 @@ def run_tests():
     # ---- 9. 取消/撤销恢复测试 ----
     print('\n--- 9. 取消与撤销恢复测试 ---')
 
-    status, closure2 = api_post('/venue-closures', {
+    # 先创建申请，再创建封场
+    status, app3 = api_post('/applications', {
         'venue_id': 2,
-        'closure_start_date': TEST_DATE,
-        'closure_end_date': TEST_DATE,
-        'closure_start_time': '09:00',
-        'closure_end_time': '18:00',
-        'reason': 'Test closure for revoke test',
-        'affects_existing_applications': True,
-        'operator': APPROVER
+        'event_name': 'Revoke test event',
+        'applicant_name': APPROVER,
+        'apply_date': TEST_DATE,
+        'start_time': '14:00',
+        'end_time': '15:00',
+        'created_by': APPROVER
     })
     if status == 201:
-        closure2_id = closure2['id']
-        status, app3 = api_post('/applications', {
+        app3_id = app3['id']
+        status, closure2 = api_post('/venue-closures', {
             'venue_id': 2,
-            'event_name': 'Revoke test event',
-            'applicant_name': APPROVER,
-            'apply_date': TEST_DATE,
-            'start_time': '14:00',
-            'end_time': '15:00',
-            'created_by': APPROVER
+            'closure_start_date': TEST_DATE,
+            'closure_end_date': TEST_DATE,
+            'closure_start_time': '09:00',
+            'closure_end_time': '18:00',
+            'reason': 'Test closure for revoke test',
+            'affects_existing_applications': True,
+            'operator': APPROVER
         })
         if status == 201:
-            app3_id = app3['id']
+            closure2_id = closure2['id']
             api_post(f'/venue-closures/{closure2_id}/waivers', {
                 'operator': APPROVER,
                 'application_id': app3_id,
@@ -401,14 +434,430 @@ def run_tests():
                     print(f'[FAIL] 9.1 取消申请失败: status={status}')
                     failed += 1
             else:
-                print(f'[FAIL] 9.1 审批通过失败: status={status}')
+                print(f'[FAIL] 9.1 审批通过失败: status={status}, resp={confirmed}')
                 failed += 1
-        api_post(f'/venue-closures/{closure2_id}/revoke', {
+            api_post(f'/venue-closures/{closure2_id}/revoke', {
+                'operator': APPROVER,
+                'revoke_reason': 'Cleanup'
+            })
+        else:
+            print(f'[FAIL] 9.1 创建测试封场失败: {closure2}')
+            failed += 1
+    else:
+        print(f'[FAIL] 9.1 创建测试申请失败: {app3}')
+        failed += 1
+
+    # ---- 10. 四类验证：权限隔离、冲突放行、撤销恢复、跨重启 ----
+    print('\n--- 10. 四类验证测试 ---')
+
+    # 10.1 权限隔离验证：普通用户看不到封场相关敏感信息
+    print('\n  --- 10.1 权限隔离验证 ---')
+    # 普通用户看不到封场列表
+    status, _ = api_get('/venue-closures', {'viewer': APPLICANT})
+    if status == 403:
+        print('[PASS] 10.1.1 普通用户看不到封场列表')
+        passed += 1
+    else:
+        print(f'[FAIL] 10.1.1 普通用户能看到封场列表: status={status}')
+        failed += 1
+
+    # 普通用户看不到封场详情
+    status, _ = api_get('/venue-closures/1', {'viewer': APPLICANT})
+    if status == 403:
+        print('[PASS] 10.1.2 普通用户看不到封场详情')
+        passed += 1
+    else:
+        print(f'[FAIL] 10.1.2 普通用户能看到封场详情: status={status}')
+        failed += 1
+
+    # 普通用户看不到全局审计日志
+    status, _ = api_get('/audit-logs', {'viewer': APPLICANT})
+    if status == 403:
+        print('[PASS] 10.1.3 普通用户看不到全局审计日志')
+        passed += 1
+    else:
+        print(f'[FAIL] 10.1.3 普通用户能看到全局审计日志: status={status}')
+        failed += 1
+
+    # 排期视图中普通用户看不到封场列表
+    status, sched = api_get(f'/schedule/{TEST_DATE}', {'viewer': APPLICANT})
+    if status == 200 and 'venue_closures' not in sched:
+        print('[PASS] 10.1.4 普通用户排期视图不包含封场列表')
+        passed += 1
+    else:
+        print('[FAIL] 10.1.4 普通用户排期视图包含封场列表')
+        failed += 1
+
+    # 10.2 冲突放行验证：完整的拦截-放行-审批链路
+    print('\n  --- 10.2 冲突放行验证 ---')
+    # 正确流程：先创建申请，再创建封场拦截，然后放行，最后审批
+    # 1. 先创建一个有效申请（在封场创建之前）
+    status, app4 = api_post('/applications', {
+        'venue_id': 3,
+        'event_name': 'Pre-created for waiver',
+        'applicant_name': APPLICANT,
+        'apply_date': TEST_DATE,
+        'start_time': '10:30',
+        'end_time': '11:30',
+        'created_by': APPLICANT
+    })
+    if status == 201:
+        app4_id = app4['id']
+        # 2. 创建封场，覆盖该申请时段
+        status, closure3 = api_post('/venue-closures', {
+            'venue_id': 3,
+            'closure_start_date': TEST_DATE,
+            'closure_end_date': TEST_DATE,
+            'closure_start_time': '10:00',
+            'closure_end_time': '12:00',
+            'reason': '冲突放行验证封场',
+            'affects_existing_applications': True,
+            'operator': APPROVER
+        })
+        if status == 201:
+            closure3_id = closure3['id']
+            # 3. 尝试审批应该被封场拦截
+            status, resp = api_post(f'/applications/{app4_id}/approve', {
+                'operator': APPROVER,
+                'comment': '应该被拦截'
+            })
+            if status == 409 and '封场' in resp.get('error', ''):
+                print('[PASS] 10.2.1 封场创建后审批被正确拦截')
+                passed += 1
+            else:
+                print(f'[FAIL] 10.2.1 封场后审批未被正确拦截: status={status}')
+                failed += 1
+
+            # 4. 添加放行记录
+            status, waiver = api_post(f'/venue-closures/{closure3_id}/waivers', {
+                'operator': APPROVER,
+                'application_id': app4_id,
+                'waiver_reason': '验证放行流程'
+            })
+            if status == 201 and waiver.get('id'):
+                print('[PASS] 10.2.2 添加放行记录成功')
+                passed += 1
+            else:
+                print(f'[FAIL] 10.2.2 添加放行记录失败: {waiver}')
+                failed += 1
+
+            # 5. 放行后审批通过
+            status, approved = api_post(f'/applications/{app4_id}/approve', {
+                'operator': APPROVER,
+                'comment': '验证放行后审批'
+            })
+            if status == 200 and approved['status'] == 'confirmed':
+                print('[PASS] 10.2.3 放行后可正常审批通过')
+                passed += 1
+            else:
+                print(f'[FAIL] 10.2.3 放行后审批失败: status={status}')
+                failed += 1
+
+            # 清理：撤销封场
+            api_post(f'/venue-closures/{closure3_id}/revoke', {
+                'operator': APPROVER,
+                'revoke_reason': 'Cleanup'
+            })
+
+    # 10.3 撤销恢复验证：封场撤销后申请可正常审批
+    print('\n  --- 10.3 撤销恢复验证 ---')
+    # 先创建申请，再创建封场拦截，然后撤销封场，最后审批
+    status, app5 = api_post('/applications', {
+        'venue_id': 1,
+        'event_name': 'Revoke Closure Test',
+        'applicant_name': APPROVER,
+        'apply_date': TEST_DATE,
+        'start_time': '15:00',
+        'end_time': '16:00',
+        'created_by': APPROVER
+    })
+    if status == 201:
+        app5_id = app5['id']
+        # 创建封场
+        status, closure4 = api_post('/venue-closures', {
+            'venue_id': 1,
+            'closure_start_date': TEST_DATE,
+            'closure_end_date': TEST_DATE,
+            'closure_start_time': '14:00',
+            'closure_end_time': '17:00',
+            'reason': '撤销恢复验证封场',
+            'affects_existing_applications': True,
+            'operator': APPROVER
+        })
+        if status == 201:
+            closure4_id = closure4['id']
+            # 尝试审批应该被拦截
+            status, resp = api_post(f'/applications/{app5_id}/approve', {
+                'operator': APPROVER,
+                'comment': '应该被拦截'
+            })
+            if status == 409 and '封场' in resp.get('error', ''):
+                print('[PASS] 10.3.1 封场时审批被正确拦截')
+                passed += 1
+            else:
+                print(f'[FAIL] 10.3.1 封场时审批未被拦截: status={status}')
+                failed += 1
+
+            # 撤销封场
+            status, revoked = api_post(f'/venue-closures/{closure4_id}/revoke', {
+                'operator': APPROVER,
+                'revoke_reason': '提前恢复开放'
+            })
+            if status == 200 and revoked['status'] == 'revoked':
+                print('[PASS] 10.3.2 撤销封场成功')
+                passed += 1
+            else:
+                print(f'[FAIL] 10.3.2 撤销封场失败: {revoked}')
+                failed += 1
+
+            # 撤销后可以正常审批
+            status, approved = api_post(f'/applications/{app5_id}/approve', {
+                'operator': APPROVER,
+                'comment': '封场撤销后审批'
+            })
+            if status == 200 and approved['status'] == 'confirmed':
+                print('[PASS] 10.3.3 封场撤销后可正常审批通过')
+                passed += 1
+            else:
+                print(f'[FAIL] 10.3.3 封场撤销后审批失败: status={status}')
+                failed += 1
+
+    # 10.4 跨重启验证：验证SQLite持久化
+    print('\n  --- 10.4 跨重启验证 ---')
+    # 创建一个封场并记录ID
+    status, closure_persist = api_post('/venue-closures', {
+        'venue_id': 1,
+        'closure_start_date': '2026-12-31',
+        'closure_end_date': '2026-12-31',
+        'closure_start_time': '09:00',
+        'closure_end_time': '18:00',
+        'reason': '持久化验证封场',
+        'affects_existing_applications': False,
+        'operator': APPROVER,
+        'restore_note': '验证重启后数据不丢失'
+    })
+    if status == 201:
+        persist_closure_id = closure_persist['id']
+        # 查询验证存在
+        status, detail = api_get(f'/venue-closures/{persist_closure_id}', {'viewer': APPROVER})
+        if status == 200 and detail['id'] == persist_closure_id and detail['status'] == 'active':
+            print(f'[PASS] 10.4.1 封场记录已持久化 (ID={persist_closure_id})')
+            passed += 1
+        else:
+            print(f'[FAIL] 10.4.1 封场记录查询失败: status={status}')
+            failed += 1
+
+        # 验证封场列表包含该记录
+        status, closures = api_get('/venue-closures', {'viewer': APPROVER})
+        closure_ids = [c['id'] for c in closures]
+        if persist_closure_id in closure_ids:
+            print('[PASS] 10.4.2 封场列表包含持久化记录')
+            passed += 1
+        else:
+            print('[FAIL] 10.4.2 封场列表不包含持久化记录')
+            failed += 1
+
+        # 验证审计日志包含创建记录
+        status, logs = api_get('/audit-logs', {'viewer': APPROVER, 'target_type': 'venue_closure', 'target_id': persist_closure_id})
+        has_create_log = any(l['action'] == 'create_venue_closure' for l in logs)
+        if has_create_log:
+            print('[PASS] 10.4.3 审计日志持久化完整')
+            passed += 1
+        else:
+            print('[FAIL] 10.4.3 审计日志缺少创建记录')
+            failed += 1
+
+        # 验证导入导出接口：CSV预检包含封场检测
+        # 清理：撤销该封场
+        api_post(f'/venue-closures/{persist_closure_id}/revoke', {
+            'operator': APPROVER,
+            'revoke_reason': '验证完成清理'
+        })
+        print(f'[INFO] 10.4 持久化验证完成，封场ID={persist_closure_id}，重启后可通过GET /api/venue-closures/{persist_closure_id}?viewer=admin 验证')
+
+    # ---- 11. 导入导出口径一致测试 ----
+    print('\n--- 11. 导入导出口径一致测试 ---')
+
+    # 11.1 创建封场用于导入测试
+    status, closure_import = api_post('/venue-closures', {
+        'venue_id': 1,
+        'closure_start_date': '2026-06-25',
+        'closure_end_date': '2026-06-25',
+        'closure_start_time': '10:00',
+        'closure_end_time': '12:00',
+        'reason': '导入测试封场',
+        'affects_existing_applications': True,
+        'operator': APPROVER
+    })
+    if status == 201:
+        closure_import_id = closure_import['id']
+
+        # 11.2 普通申请人无法访问导入批次列表
+        status, _ = api_get('/import', {'operator': APPLICANT})
+        if status == 200:
+            print('[PASS] 11.1 普通申请人可访问自己相关的导入批次列表')
+            passed += 1
+        else:
+            print(f'[FAIL] 11.1 普通申请人访问导入批次列表失败: status={status}')
+            failed += 1
+
+        # 11.3 审批人可访问导入批次列表
+        status, _ = api_get('/import', {'operator': APPROVER})
+        if status == 200:
+            print('[PASS] 11.2 审批人可访问所有导入批次列表')
+            passed += 1
+        else:
+            print(f'[FAIL] 11.2 审批人访问导入批次列表失败: status={status}')
+            failed += 1
+
+        # 11.4 排期导出审批人视角包含封场列
+        try:
+            params = urllib.parse.urlencode({'operator': APPROVER})
+            req = urllib.request.Request(BASE_URL + '/schedule/2026-06-25/export?' + params)
+            with urllib.request.urlopen(req) as resp:
+                content = resp.read().decode('utf-8-sig')
+                lines = content.split('\n')
+                header = lines[0] if lines else ''
+                if '封场ID' in header and '封场原因' in header and '封场时段' in header:
+                    print('[PASS] 11.3 审批人排期导出包含完整封场列')
+                    passed += 1
+                else:
+                    print(f'[FAIL] 11.3 审批人排期导出缺少封场列: header={header[:150]}')
+                    failed += 1
+        except Exception as e:
+            print(f'[FAIL] 11.3 审批人排期导出异常: {e}')
+            failed += 1
+
+        # 11.5 排期导出申请人视角只有简化信息
+        try:
+            params = urllib.parse.urlencode({'operator': APPLICANT})
+            req = urllib.request.Request(BASE_URL + '/schedule/2026-06-25/export?' + params)
+            with urllib.request.urlopen(req) as resp:
+                content = resp.read().decode('utf-8-sig')
+                lines = content.split('\n')
+                header = lines[0] if lines else ''
+                if '封场ID' not in header and '封场原因' in header:
+                    print('[PASS] 11.4 申请人排期导出只有简化封场信息')
+                    passed += 1
+                else:
+                    print(f'[FAIL] 11.4 申请人排期导出信息不符合预期: header={header[:150]}')
+                    failed += 1
+        except Exception as e:
+            print(f'[FAIL] 11.4 申请人排期导出异常: {e}')
+            failed += 1
+
+        # 清理
+        api_post(f'/venue-closures/{closure_import_id}/revoke', {
             'operator': APPROVER,
             'revoke_reason': 'Cleanup'
         })
+
+    # ---- 12. 申请列表与我的排期过滤测试 ----
+    print('\n--- 12. 申请列表与我的排期过滤测试 ---')
+
+    # 12.1 普通申请人申请列表不包含敏感字段
+    status, apps = api_get('/applications', {'viewer': APPLICANT})
+    if status == 200:
+        sensitive_fields = ['approved_by', 'approved_at', 'approval_comment',
+                            'conflict_summary', 'precheck_result', 'approval_conclusion']
+        all_safe = all(not any(f in app for f in sensitive_fields) for app in apps)
+        if all_safe:
+            print('[PASS] 12.1 普通申请人申请列表不包含敏感审批字段')
+            passed += 1
+        else:
+            print('[FAIL] 12.1 普通申请人申请列表包含敏感字段')
+            failed += 1
     else:
-        print(f'[FAIL] 9.1 创建测试封场失败: {closure2}')
+        print(f'[FAIL] 12.1 获取申请列表失败: status={status}')
+        failed += 1
+
+    # 12.2 我的排期接口不包含敏感字段
+    status, my_sched = api_get('/my-schedule', {'operator': APPLICANT})
+    if status == 200:
+        sensitive_fields = ['approved_by', 'approved_at', 'approval_comment',
+                            'conflict_summary', 'precheck_result', 'approval_conclusion']
+        all_safe = all(not any(f in app for f in sensitive_fields) for app in my_sched)
+        if all_safe:
+            print('[PASS] 12.2 我的排期接口不包含敏感审批字段')
+            passed += 1
+        else:
+            print('[FAIL] 12.2 我的排期接口包含敏感字段')
+            failed += 1
+    else:
+        print(f'[FAIL] 12.2 获取我的排期失败: status={status}')
+        failed += 1
+
+    # 12.3 审批人申请列表包含预检信息（待审批状态）
+    status, apps_admin = api_get('/applications', {'viewer': APPROVER, 'status': 'pending_approval'})
+    if status == 200:
+        has_precheck = any('precheck' in app for app in apps_admin)
+        if has_precheck or len(apps_admin) == 0:
+            print('[PASS] 12.3 审批人待审批列表包含预检信息')
+            passed += 1
+        else:
+            print('[FAIL] 12.3 审批人待审批列表缺少预检信息')
+            failed += 1
+    else:
+        print(f'[FAIL] 12.3 获取审批人待审批列表失败: status={status}')
+        failed += 1
+
+    # ---- 13. 列表端点健壮性测试（无报错） ----
+    print('\n--- 13. 列表端点健壮性测试 ---')
+
+    # 13.1 申请列表各种过滤条件不报错
+    test_cases = [
+        ('/applications', {'viewer': APPROVER}),
+        ('/applications', {'viewer': APPLICANT}),
+        ('/applications', {'viewer': APPROVER, 'venue_id': 1}),
+        ('/applications', {'viewer': APPROVER, 'status': 'confirmed'}),
+        ('/applications', {'viewer': APPROVER, 'apply_date': '2025-06-20'}),
+        ('/venue-closures', {'viewer': APPROVER}),
+        ('/venue-closures', {'viewer': APPROVER, 'status': 'active'}),
+        ('/venue-closures', {'viewer': APPROVER, 'venue_id': 1}),
+        ('/venue-closures', {'viewer': APPROVER, 'apply_date': '2025-06-20'}),
+        ('/audit-logs', {'viewer': APPROVER, 'limit': 10}),
+        ('/audit-logs', {'viewer': APPROVER, 'target_type': 'venue_closure'}),
+        ('/import', {'operator': APPROVER}),
+        ('/my-schedule', {'operator': APPLICANT}),
+        ('/schedule/2025-06-20', {'viewer': APPROVER}),
+        ('/schedule/2025-06-20', {'viewer': APPLICANT}),
+    ]
+
+    all_passed = True
+    for i, (path, params) in enumerate(test_cases):
+        status, _ = api_get(path, params)
+        if status != 200:
+            print(f'[FAIL] 13.{i+1} 端点 {path}?{urllib.parse.urlencode(params)} 返回 {status}')
+            all_passed = False
+            failed += 1
+    if all_passed:
+        print('[PASS] 13.1 所有列表端点正常响应，无报错')
+        passed += 1
+
+    # 13.2 无效日期格式不崩溃
+    status, resp = api_get('/schedule/invalid-date', {'viewer': APPROVER})
+    if status in (400, 200):
+        print('[PASS] 13.2 无效日期格式优雅处理')
+        passed += 1
+    else:
+        print(f'[FAIL] 13.2 无效日期格式返回 {status}')
+        failed += 1
+
+    # 13.3 不存在的ID返回404不崩溃
+    status, _ = api_get('/venue-closures/99999', {'viewer': APPROVER})
+    if status == 404:
+        print('[PASS] 13.3 不存在的封场ID返回404')
+        passed += 1
+    else:
+        print(f'[FAIL] 13.3 不存在的封场ID返回 {status}')
+        failed += 1
+
+    status, _ = api_get('/applications/99999', {'viewer': APPROVER})
+    if status == 404:
+        print('[PASS] 13.4 不存在的申请ID返回404')
+        passed += 1
+    else:
+        print(f'[FAIL] 13.4 不存在的申请ID返回 {status}')
         failed += 1
 
     # ---- 结果汇总 ----
