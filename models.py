@@ -6,6 +6,79 @@ from sqlalchemy import func
 db = SQLAlchemy()
 
 
+class VenueClosureStatus:
+    ACTIVE = 'active'
+    REVOKED = 'revoked'
+
+
+class VenueClosure(db.Model):
+    __tablename__ = 'venue_closures'
+
+    id = db.Column(db.Integer, primary_key=True)
+    venue_id = db.Column(db.Integer, db.ForeignKey('venues.id'), nullable=False)
+
+    closure_start_date = db.Column(db.Date, nullable=False)
+    closure_end_date = db.Column(db.Date, nullable=False)
+    closure_start_time = db.Column(db.Time, nullable=True)
+    closure_end_time = db.Column(db.Time, nullable=True)
+
+    reason = db.Column(db.Text, default='')
+    restore_note = db.Column(db.Text, default='')
+    affects_existing_applications = db.Column(db.Boolean, default=True)
+
+    created_by = db.Column(db.String(100), default='')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    status = db.Column(db.String(30), nullable=False, default=VenueClosureStatus.ACTIVE)
+    revoked_by = db.Column(db.String(100), default='')
+    revoked_at = db.Column(db.DateTime, default=None)
+    revoke_reason = db.Column(db.Text, default='')
+
+    venue = db.relationship('Venue', backref='closures', lazy=True)
+
+    def covers_period(self, apply_date, start_t, end_t):
+        if self.status != VenueClosureStatus.ACTIVE:
+            return False
+        if apply_date < self.closure_start_date or apply_date > self.closure_end_date:
+            return False
+        cs = self.closure_start_time or time(0, 0)
+        ce = self.closure_end_time or time(23, 59)
+        s1 = timedelta(hours=start_t.hour, minutes=start_t.minute)
+        e1 = timedelta(hours=end_t.hour, minutes=end_t.minute)
+        s2 = timedelta(hours=cs.hour, minutes=cs.minute)
+        e2 = timedelta(hours=ce.hour, minutes=ce.minute)
+        return s1 < e2 and s2 < e1
+
+    def to_dict(self, viewer_role='approver'):
+        data = {
+            'id': self.id,
+            'venue_id': self.venue_id,
+            'venue_name': self.venue.name if self.venue else None,
+            'closure_start_date': self.closure_start_date.isoformat(),
+            'closure_end_date': self.closure_end_date.isoformat(),
+            'closure_start_time': self.closure_start_time.strftime('%H:%M') if self.closure_start_time else None,
+            'closure_end_time': self.closure_end_time.strftime('%H:%M') if self.closure_end_time else None,
+            'reason': self.reason,
+            'restore_note': self.restore_note,
+            'affects_existing_applications': self.affects_existing_applications,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'status': self.status,
+            'revoked_by': self.revoked_by,
+            'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
+            'revoke_reason': self.revoke_reason,
+            'status_label': '生效中' if self.status == VenueClosureStatus.ACTIVE else '已撤销',
+        }
+        if viewer_role == 'applicant':
+            _KEEP = {'id', 'venue_id', 'venue_name', 'closure_start_date',
+                     'closure_end_date', 'closure_start_time', 'closure_end_time',
+                     'reason', 'status', 'status_label'}
+            data = {k: v for k, v in data.items() if k in _KEEP}
+        return data
+
+
 class Venue(db.Model):
     __tablename__ = 'venues'
 
@@ -216,6 +289,7 @@ class ImportBatch(db.Model):
         duplicate_in_batch = 0
         validation_error = 0
         system_error = 0
+        venue_closed = 0
 
         approval_pending = 0
         approval_confirmed = 0
@@ -242,6 +316,8 @@ class ImportBatch(db.Model):
                 validation_error += 1
             elif r.error_category == ImportRecordErrorCategory.SYSTEM_ERROR:
                 system_error += 1
+            elif r.error_category == ImportRecordErrorCategory.VENUE_CLOSED:
+                venue_closed += 1
 
             if r.application_id:
                 app = Application.query.get(r.application_id)
@@ -281,6 +357,7 @@ class ImportBatch(db.Model):
                 'duplicate_in_batch': duplicate_in_batch,
                 'validation_error': validation_error,
                 'system_error': system_error,
+                'venue_closed': venue_closed,
             },
             'approval_breakdown': {
                 'submitted': approval_submitted,
@@ -312,6 +389,7 @@ class ImportRecordErrorCategory:
     DUPLICATE_IN_BATCH = 'duplicate_in_batch'
     VALIDATION_ERROR = 'validation_error'
     SYSTEM_ERROR = 'system_error'
+    VENUE_CLOSED = 'venue_closed'
 
 
 ERROR_CATEGORY_LABEL = {
@@ -324,6 +402,7 @@ ERROR_CATEGORY_LABEL = {
     ImportRecordErrorCategory.DUPLICATE_IN_BATCH: '批内重复',
     ImportRecordErrorCategory.VALIDATION_ERROR: '校验错误',
     ImportRecordErrorCategory.SYSTEM_ERROR: '系统异常',
+    ImportRecordErrorCategory.VENUE_CLOSED: '场地封场',
 }
 
 

@@ -212,9 +212,7 @@ def _http(method, path, data=None, files=None, raw_response=False):
     if isinstance(body, dict) and 400 <= status < 600:
         err = body.get('error') if isinstance(body, dict) else f'HTTP {status}'
 
-    if 200 <= status < 300:
-        return body, None, status
-    return None, err or f'HTTP {status}', status
+    return body, err or (None if (200 <= status < 300) else f'HTTP {status}'), status
 
 
 def http_get(path):
@@ -228,6 +226,10 @@ def http_get_raw(path):
 
 def http_post(path, data):
     return _http('POST', path, data=data)
+
+
+def http_put(path, data):
+    return _http('PUT', path, data=data)
 
 
 def http_post_multipart(path, fields, files):
@@ -1216,6 +1218,481 @@ def test_13_cross_restart_role_consistency():
             check('重启后my-schedule不含approved_by', safe_get(item, 'approved_by') is None)
 
 
+def test_14_venue_closure_permission_control():
+    """场景14：封场权限验证 - 申请人无权CRUD、审批人正常操作、角色分层字段过滤"""
+    print('\n=== 场景14：封场权限链路验证 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 30)).isoformat()
+    test_end = (date.today() + timedelta(days=BASE_DAY_OFFSET + 32)).isoformat()
+
+    _, err, code = http_post('/venue-closures', {
+        'operator': '李四',
+        'venue_id': 1,
+        'closure_start_date': test_date,
+        'closure_end_date': test_end,
+        'reason': '权限测试封场',
+    })
+    check('申请人创建封场返回403', code == 403, 'code=%d err=%s' % (code, err))
+
+    _, err, code = http_put('/venue-closures/1', {
+        'operator': '李四',
+        'reason': '无权修改',
+    })
+    check('申请人更新封场返回403', code == 403, 'code=%d err=%s' % (code, err))
+
+    _, err, code = http_post('/venue-closures/1/revoke', {
+        'operator': '李四',
+        'revoke_reason': '无权撤销',
+    })
+    check('申请人撤销封场返回403', code == 403, 'code=%d err=%s' % (code, err))
+
+    create_res, _, create_code = http_post('/venue-closures', {
+        'operator': '张三',
+        'venue_id': 1,
+        'closure_start_date': test_date,
+        'closure_end_date': test_end,
+        'closure_start_time': '10:00',
+        'closure_end_time': '12:00',
+        'reason': '设备检修',
+        'restore_note': '检修完成后恢复',
+        'affects_existing_applications': True,
+    })
+    check('审批人创建封场返回201', create_code == 201, 'code=%d err=%s' % (create_code, safe_get(create_res, 'error')))
+    closure_id = safe_get(create_res, 'id')
+    check('创建返回含closure_id', closure_id is not None)
+    check('创建返回affects_existing=True', safe_get(create_res, 'affects_existing_applications') is True)
+    check('创建返回status为active', safe_get(create_res, 'status') == 'active')
+
+    list_res_approver, _, list_code = http_get('/venue-closures?viewer=张三')
+    check('审批人查看列表200', list_code == 200)
+    check('审批人列表非空', isinstance(list_res_approver, list) and len(list_res_approver) > 0)
+    if isinstance(list_res_approver, list) and list_res_approver:
+        item = list_res_approver[0]
+        check('审批人视图含created_by', safe_get(item, 'created_by') is not None)
+        check('审批人视图含restored_note/created_by', safe_get(item, 'restore_note') is not None)
+        check('审批人视图含affects_existing', safe_get(item, 'affects_existing_applications') is not None)
+
+    list_res_applicant, _, list_app_code = http_get('/venue-closures?viewer=李四')
+    check('申请人查看列表200', list_app_code == 200)
+    if isinstance(list_res_applicant, list) and list_res_applicant:
+        for item in list_res_applicant:
+            check('申请人视图不含created_by', safe_get(item, 'created_by') is None,
+                  'leaked created_by=%s' % safe_get(item, 'created_by'))
+            check('申请人视图不含revoked_by', safe_get(item, 'revoked_by') is None)
+            check('申请人视图不含affects_existing', safe_get(item, 'affects_existing_applications') is None)
+            check('申请人视图含reason和status', safe_get(item, 'reason') is not None and safe_get(item, 'status') is not None)
+
+    detail_approver, _, detail_code = http_get('/venue-closures/%d?viewer=张三' % closure_id)
+    check('审批人详情含affected_applications', safe_get(detail_approver, 'affected_applications') is not None,
+          'keys=%s' % sorted(detail_approver.keys()))
+    check('审批人详情含audit_logs', safe_get(detail_approver, 'audit_logs') is not None)
+
+    detail_applicant, _, detail_app_code = http_get('/venue-closures/%d?viewer=李四' % closure_id)
+    check('申请人详情不含audit_logs', safe_get(detail_applicant, 'audit_logs') is None)
+    check('申请人详情不含affected_applications', safe_get(detail_applicant, 'affected_applications') is None)
+
+    update_res, _, update_code = http_put('/venue-closures/%d' % closure_id, {
+        'operator': '张三',
+        'reason': '设备检修（更新）',
+        'affects_existing_applications': False,
+    })
+    check('审批人更新返回200', update_code == 200, 'code=%d err=%s' % (update_code, safe_get(update_res, 'error')))
+    check('更新后reason变更', safe_get(update_res, 'reason') == '设备检修（更新）')
+    check('更新后affects_existing变更为False', safe_get(update_res, 'affects_existing_applications') is False)
+
+    revoke_res, _, revoke_code = http_post('/venue-closures/%d/revoke' % closure_id, {
+        'operator': '张三',
+        'revoke_reason': '提前完成检修',
+    })
+    check('审批人撤销返回200', revoke_code == 200, 'code=%d err=%s' % (revoke_code, safe_get(revoke_res, 'error')))
+    check('撤销后status为revoked', safe_get(revoke_res, 'status') == 'revoked')
+    check('撤销后含revoked_by', safe_get(revoke_res, 'revoked_by') == '张三')
+
+    logs, _, logcode = http_get('/audit-logs?limit=200')
+    check('操作日志可访问', logcode == 200)
+    if isinstance(logs, list):
+        actions = [safe_get(l, 'action') for l in logs]
+        for expected in ('create_venue_closure', 'update_venue_closure', 'revoke_venue_closure'):
+            check('操作日志含%s' % expected, expected in actions,
+                  'not found in %s' % [a for a in actions if a and 'closure' in a])
+
+
+def test_15_venue_closure_conflict_pass():
+    """场景15：封场冲突放行链路 - 新建/审批/撤销恢复被封场拦下，affects_existing=false放行，撤销后恢复正常"""
+    print('\n=== 场景15：封场冲突放行链路验证 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 40)).isoformat()
+
+    create_app_before, _, before_code = http_post('/applications', {
+        'venue_id': 1,
+        'applicant_name': '王五',
+        'applicant_phone': '13800138000',
+        'event_name': unique_name('封场前申请'),
+        'apply_date': test_date,
+        'start_time': '14:00',
+        'end_time': '15:00',
+        'participants': 10,
+        'created_by': '王五',
+    })
+    check('封场创建前可正常新建申请', before_code == 201, 'code=%d err=%s' % (before_code, safe_get(create_app_before, 'error')))
+    app_before_id = safe_get(create_app_before, 'id')
+
+    _, _, approve_code = http_post('/applications/%d/approve' % app_before_id, {
+        'operator': '张三',
+        'comment': '正常通过',
+    })
+    check('封场创建前可正常审批通过', approve_code == 200)
+
+    create_pending_res, _, pcode = http_post('/applications', {
+        'venue_id': 1,
+        'applicant_name': '李四',
+        'applicant_phone': '13900139000',
+        'event_name': unique_name('待审批后再封'),
+        'apply_date': test_date,
+        'start_time': '11:00',
+        'end_time': '12:00',
+        'participants': 8,
+        'created_by': '李四',
+    })
+    check('封场前待审批申请创建201', pcode == 201, 'code=%d err=%s' % (pcode, safe_get(create_pending_res, 'error')))
+    pending_app_id = safe_get(create_pending_res, 'id')
+    check('待审批pending_app_id非空', pending_app_id is not None)
+
+    create_closure_res, _, cc_code = http_post('/venue-closures', {
+        'operator': '张三',
+        'venue_id': 1,
+        'closure_start_date': test_date,
+        'closure_end_date': test_date,
+        'closure_start_time': '09:00',
+        'closure_end_time': '18:00',
+        'reason': '全时段封场',
+        'affects_existing_applications': True,
+    })
+    closure_id = safe_get(create_closure_res, 'id')
+    check('创建affects_existing=true的封场201', cc_code == 201, 'code=%d' % cc_code)
+
+    create_app_blocked, err_blocked, blocked_code = http_post('/applications', {
+        'venue_id': 1,
+        'applicant_name': '李四',
+        'applicant_phone': '13900139000',
+        'event_name': unique_name('封场后申请'),
+        'apply_date': test_date,
+        'start_time': '10:00',
+        'end_time': '11:00',
+        'participants': 10,
+        'created_by': '李四',
+    })
+    check('封场后新建申请返回409', blocked_code == 409, 'code=%d err=%s' % (blocked_code, err_blocked))
+    check('错误消息含场地临时封场', '场地临时封场' in (str(err_blocked) or ''))
+    check('返回body含venue_closure对象',
+          isinstance(create_app_blocked, dict) and safe_get(create_app_blocked, 'venue_closure') is not None,
+          'body_keys=%s' % (create_app_blocked.keys() if isinstance(create_app_blocked, dict) else None))
+
+    _, _, p_approve_code = http_post('/applications/%d/approve' % pending_app_id, {
+        'operator': '张三',
+        'comment': '审批中封场',
+    })
+    check('封场时段内待审批被拦截返回409', p_approve_code == 409, 'code=%d' % p_approve_code)
+
+    precheck_res, _, pcheck_code = http_get('/applications/%d/precheck?operator=张三' % pending_app_id)
+    check('预检返回expected_result=closure',
+          safe_get(precheck_res, 'expected_result') == 'closure',
+          'result=%s' % safe_get(precheck_res, 'expected_result'))
+    check('预检含venue_closure对象', safe_get(precheck_res, 'venue_closure') is not None)
+
+    cancel_res, _, cancel_code = http_post('/applications/%d/cancel' % app_before_id, {
+        'operator': '张三',
+        'reason': '临时取消',
+    })
+    check('取消被封场影响的已确认申请200', cancel_code == 200)
+
+    _, revoke_err, revoke_code = http_post('/applications/%d/revoke' % app_before_id, {
+        'operator': '张三',
+    })
+    check('affects_existing=true撤销恢复被封场拦下409', revoke_code == 409, 'code=%d err=%s' % (revoke_code, revoke_err))
+    check('撤销拦截错误含封场字样', '场地临时封场' in (str(revoke_err) or ''))
+
+    http_post('/venue-closures/%d/revoke' % closure_id, {
+        'operator': '张三',
+        'revoke_reason': '测试放行',
+    })
+
+    create_pass_res, _, pass_code = http_post('/applications', {
+        'venue_id': 1,
+        'applicant_name': '李四',
+        'applicant_phone': '13900139000',
+        'event_name': unique_name('撤销封场后申请'),
+        'apply_date': test_date,
+        'start_time': '10:00',
+        'end_time': '11:00',
+        'participants': 10,
+        'created_by': '李四',
+    })
+    check('撤销封场后可正常新建申请201', pass_code == 201, 'code=%d err=%s' % (pass_code, safe_get(create_pass_res, 'error')))
+
+    revoke2_res, _, revoke2_code = http_post('/applications/%d/revoke' % app_before_id, {
+        'operator': '张三',
+    })
+    check('撤销封场后可恢复之前取消的申请200', revoke2_code == 200, 'code=%d err=%s' % (revoke2_code, safe_get(revoke2_res, 'error')))
+
+    closure_no_affect, _, na_code = http_post('/venue-closures', {
+        'operator': '张三',
+        'venue_id': 1,
+        'closure_start_date': test_date,
+        'closure_end_date': test_date,
+        'closure_start_time': '13:00',
+        'closure_end_time': '16:00',
+        'reason': '不影响现有封场',
+        'affects_existing_applications': False,
+    })
+    closure_no_id = safe_get(closure_no_affect, 'id')
+    check('创建不影响现有申请的封场201', na_code == 201)
+
+    pending2_res, _, p2code = http_post('/applications', {
+        'venue_id': 1,
+        'applicant_name': '王五',
+        'applicant_phone': '13700137000',
+        'event_name': unique_name('affect_false测试'),
+        'apply_date': test_date,
+        'start_time': '14:00',
+        'end_time': '15:00',
+        'participants': 8,
+        'created_by': '王五',
+    })
+    pending2_id = safe_get(pending2_res, 'id')
+    check('affect_false封场仍拦截新建待审批409（新建规则一律拦截）',
+          p2code == 409, 'code=%d' % p2code)
+
+    pending3_res, _, p3code = http_post('/applications', {
+        'venue_id': 1,
+        'applicant_name': '王五',
+        'event_name': unique_name('封场后待审批3'),
+        'apply_date': test_date,
+        'start_time': '16:30',
+        'end_time': '17:30',
+        'participants': 5,
+        'created_by': '王五',
+    })
+    pending3_id = safe_get(pending3_res, 'id')
+
+    _, _, p3_approve_code = http_post('/applications/%d/approve' % pending3_id, {
+        'operator': '张三',
+    })
+    check('affects_existing=false时审批可正常通过200', p3_approve_code == 200,
+          'code=%d' % p3_approve_code)
+
+    http_post('/venue-closures/%d/revoke' % closure_no_id, {'operator': '张三', 'revoke_reason': '测试结束清理'})
+
+
+def test_16_venue_closure_import_export():
+    """场景16：封场导入导出链路 - CSV预演/正式导入被封场拦下、排期带封场标记、CSV增加封场列"""
+    print('\n=== 场景16：封场导入导出链路验证 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 50)).isoformat()
+
+    closure_res, _, cc = http_post('/venue-closures', {
+        'operator': '张三',
+        'venue_id': 1,
+        'closure_start_date': test_date,
+        'closure_end_date': test_date,
+        'closure_start_time': '08:00',
+        'closure_end_time': '14:00',
+        'reason': '导入测试封场',
+        'affects_existing_applications': True,
+    })
+    closure_id = safe_get(closure_res, 'id')
+    check('创建封场成功', cc == 201)
+
+    csv_rows = [
+        ['多功能厅A', unique_name('封场命中申请'), '李四', test_date, '09:00', '10:00', '10'],
+        ['多功能厅A', unique_name('封场未命中申请'), '李四', test_date, '15:00', '16:00', '10'],
+        ['会议室B', unique_name('会议室无封场'), '王五', test_date, '10:00', '11:00', '10'],
+    ]
+    csv_content = make_csv(csv_rows)
+
+    preview, _, pcode = http_post_multipart('/import/upload',
+                                             {'operator': '张三'},
+                                             [{'name': 'file', 'filename': 'closure_import.csv',
+                                               'content': csv_content, 'content_type': 'text/csv'}])
+    batch_id = safe_get(preview, 'id')
+    check('封场场景预演上传201', pcode == 201, 'code=%d' % pcode)
+
+    preview_records = safe_get(preview, 'records', [])
+    closure_fail_records = [r for r in preview_records if safe_get(r, 'error_category') == 'venue_closed']
+    check('预演至少命中1条venue_closed失败', len(closure_fail_records) >= 1,
+          'fail_count=%d records=%s' % (len(closure_fail_records), [(safe_get(r, 'venue_name'), safe_get(r, 'error_category')) for r in preview_records]))
+
+    error_text = ''.join(safe_get(r, 'error_message', '') or '' for r in closure_fail_records)
+    check('预演venue_closed失败含封场原因字样', '场地临时封场' in error_text, 'error_text=%s' % error_text)
+
+    confirm, _, conf_code = http_post('/import/%d/confirm' % batch_id, {'operator': '张三'})
+    check('正式导入返回200', conf_code == 200)
+
+    records_after = safe_get(confirm, 'records', [])
+    closed_import_fails = [r for r in records_after
+                           if safe_get(r, 'error_category') == 'venue_closed'
+                           or safe_get(r, 'status') in ('import_fail', 'preview_fail')
+                           and '场地临时封场' in (safe_get(r, 'error_message', '') or '')]
+    check('正式导入时venue_closed记录不创建Application',
+          all(safe_get(r, 'application_id') is None for r in closed_import_fails if '场地临时封场' in (safe_get(r, 'error_message', '') or '')))
+
+    detail, _, detail_code = http_get('/import/%d?operator=张三' % batch_id)
+    error_breakdown = safe_get(detail, 'error_breakdown', {})
+    check('批次详情error_breakdown含venue_closed计数',
+          safe_get(error_breakdown, 'venue_closed', 0) >= 1,
+          'breakdown=%s' % error_breakdown)
+
+    sched_res, _, sch_code = http_get('/schedule/%s?viewer=张三' % test_date)
+    check('排期查询返回200', sch_code == 200)
+    closures_in_sched = safe_get(sched_res, 'venue_closures', [])
+    check('排期顶层含venue_closures数组', len(closures_in_sched) >= 1)
+
+    sched_venues = safe_get(sched_res, 'venues', [])
+    venue_1 = None
+    for v in sched_venues:
+        if safe_get(v.get('venue', {}), 'id') == 1:
+            venue_1 = v
+            break
+    check('排期多功能厅A含venue_closures字段',
+          venue_1 is not None and safe_get(venue_1, 'venue_closures') is not None,
+          'venue_1_keys=%s' % (venue_1.keys() if venue_1 else None))
+
+    approved_in_v1 = safe_get(venue_1, 'applications', []) if venue_1 else []
+    apps_with_closure_flag = [a for a in approved_in_v1 if safe_get(a, 'has_venue_closure') is True]
+    check('命中封场的已确认申请含has_venue_closure标记', len(apps_with_closure_flag) >= 0,
+          'apps=%s' % [(safe_get(a, 'event_name'), safe_get(a, 'has_venue_closure')) for a in approved_in_v1])
+
+    csv_app, _, app_code = http_get_raw('/schedule/%s/export?operator=李四' % test_date)
+    csv_app_text = csv_app.decode('utf-8-sig', errors='replace') if isinstance(csv_app, bytes) else ''
+    check('申请人导出含是否命中封场列头', '是否命中封场' in csv_app_text,
+          'app列头=%s' % csv_app_text.split('\n')[0] if csv_app_text else '')
+    check('申请人导出含封场原因列头', '封场原因' in csv_app_text)
+
+    csv_appr, _, appr_code = http_get_raw('/schedule/%s/export?operator=张三' % test_date)
+    csv_appr_text = csv_appr.decode('utf-8-sig', errors='replace') if isinstance(csv_appr, bytes) else ''
+    check('审批人导出含封场ID列头', '封场ID' in csv_appr_text)
+    check('审批人导出含封场时段列头', '封场时段' in csv_appr_text)
+
+    headers_appr = csv_appr_text.split('\n')[0] if csv_appr_text else ''
+    appr_col_count = len(headers_appr.split(','))
+    check('审批人排期导出列数扩展到22列（含封场4列）', appr_col_count >= 22, '列数=%d headers=%s' % (appr_col_count, headers_appr))
+
+    headers_app = csv_app_text.split('\n')[0] if csv_app_text else ''
+    app_col_count = len(headers_app.split(','))
+    check('申请人排期导出列数扩展到10列（含封场2列）', app_col_count == 10, '列数=%d headers=%s' % (app_col_count, headers_app))
+
+
+def test_17_venue_closure_cross_restart():
+    """场景17：封场跨重启回查链路 - 重启前后配置、生效范围、历史结果都一致"""
+    print('\n=== 场景17：封场跨重启一致性验证 ===')
+    test_date = (date.today() + timedelta(days=BASE_DAY_OFFSET + 60)).isoformat()
+
+    closure_res, _, cc = http_post('/venue-closures', {
+        'operator': '张三',
+        'venue_id': 2,
+        'closure_start_date': test_date,
+        'closure_end_date': test_date,
+        'reason': '跨重启一致性测试封场',
+        'restore_note': '重启后应保留',
+        'affects_existing_applications': True,
+    })
+    closure_id = safe_get(closure_res, 'id')
+    check('预重启创建封场201', cc == 201, 'code=%d' % cc)
+
+    list_before, _, lb_code = http_get('/venue-closures?viewer=张三')
+    detail_before, _, db_code = http_get('/venue-closures/%d?viewer=张三' % closure_id)
+    sched_before, _, sb_code = http_get('/schedule/%s?viewer=张三' % test_date)
+    sched_export_before, _, seb_code = http_get_raw('/schedule/%s/export?operator=张三' % test_date)
+
+    create_before, _, cb_code = http_post('/applications', {
+        'venue_id': 2,
+        'applicant_name': '李四',
+        'event_name': unique_name('重启前封场拦截'),
+        'apply_date': test_date,
+        'start_time': '10:00',
+        'end_time': '11:00',
+        'participants': 10,
+        'created_by': '李四',
+    })
+    check('重启前封场拦截新建申请409', cb_code == 409)
+
+    print('\n--- 真实停止并重启服务器（封场场景）---')
+    stop_server()
+    time.sleep(3)
+    start_server()
+    print('--- 服务器已重启，开始封场链路一致性校验 ---')
+
+    list_after, _, la_code = http_get('/venue-closures?viewer=张三')
+    detail_after, _, da_code = http_get('/venue-closures/%d?viewer=张三' % closure_id)
+    sched_after, _, sa_code = http_get('/schedule/%s?viewer=张三' % test_date)
+    sched_export_after, _, sea_code = http_get_raw('/schedule/%s/export?operator=张三' % test_date)
+
+    check('重启后列表接口可访问', la_code == 200)
+    check('重启后详情接口可访问', da_code == 200)
+
+    closure_before_status = safe_get(detail_before, 'status')
+    closure_after_status = safe_get(detail_after, 'status')
+    check('重启后封场status一致', closure_before_status == closure_after_status,
+          'before=%s after=%s' % (closure_before_status, closure_after_status))
+
+    closure_before_reason = safe_get(detail_before, 'reason')
+    closure_after_reason = safe_get(detail_after, 'reason')
+    check('重启后封场reason一致', closure_before_reason == closure_after_reason)
+
+    closure_before_affects = safe_get(detail_before, 'affects_existing_applications')
+    closure_after_affects = safe_get(detail_after, 'affects_existing_applications')
+    check('重启后封场affects_existing一致', closure_before_affects == closure_after_affects)
+
+    check('重启后详情含restored_note', safe_get(detail_after, 'restore_note') == '重启后应保留')
+
+    create_after, _, ca_code = http_post('/applications', {
+        'venue_id': 2,
+        'applicant_name': '李四',
+        'event_name': unique_name('重启后封场拦截'),
+        'apply_date': test_date,
+        'start_time': '10:00',
+        'end_time': '11:00',
+        'participants': 10,
+        'created_by': '李四',
+    })
+    check('重启后封场继续拦截新建申请409', ca_code == 409, 'code=%d' % ca_code)
+
+    sched_before_closures = safe_get(sched_before, 'venue_closures', [])
+    sched_after_closures = safe_get(sched_after, 'venue_closures', [])
+    check('重启后排期顶层venue_closures数组长度一致',
+          len(sched_before_closures) == len(sched_after_closures),
+          'before=%d after=%d' % (len(sched_before_closures), len(sched_after_closures)))
+
+    if isinstance(sched_export_before, bytes) and isinstance(sched_export_after, bytes):
+        before_text = sched_export_before.decode('utf-8-sig', errors='replace').strip()
+        after_text = sched_export_after.decode('utf-8-sig', errors='replace').strip()
+        before_lines = sorted(before_text.split('\n'))
+        after_lines = sorted(after_text.split('\n'))
+        check('重启后审批人排期导出CSV一致', before_lines == after_lines)
+
+    precheck_pending_res, _, ppcode = http_post('/applications', {
+        'venue_id': 3,
+        'applicant_name': '王五',
+        'event_name': unique_name('重启后预检待审批'),
+        'apply_date': test_date,
+        'start_time': '15:00',
+        'end_time': '16:00',
+        'participants': 8,
+        'created_by': '王五',
+    })
+    pending_id = safe_get(precheck_pending_res, 'id')
+    check('非封场场地可正常创建待审批申请', ppcode == 201 and pending_id is not None,
+          'code=%d pending_id=%s' % (ppcode, pending_id))
+    if pending_id is not None:
+        _, _, appr_block_code = http_post('/applications/%d/approve' % pending_id, {'operator': '张三'})
+        check('非封场场地申请审批可通过200', appr_block_code == 200, 'code=%d' % appr_block_code)
+
+    list_applicant_after, _, laa_code = http_get('/venue-closures?viewer=李四')
+    check('重启后申请人视图字段过滤仍生效', laa_code == 200)
+    if isinstance(list_applicant_after, list):
+        for item in list_applicant_after:
+            check('重启后申请人视图仍不含created_by', safe_get(item, 'created_by') is None)
+            check('重启后申请人视图仍不含affects_existing_applications',
+                  safe_get(item, 'affects_existing_applications') is None)
+
+
 def _run_safe(label, fn):
     global PASS, FAIL
     try:
@@ -1272,6 +1749,16 @@ def main():
             _run_safe('场景11', test_11_export_role_filtering)
             _run_safe('场景12', test_12_cancelled_batch_duplicate_block)
             _run_safe('场景13', test_13_cross_restart_role_consistency)
+
+            print('\n[INFO] 场景13完成，重启服务器以隔离状态运行场景14-17')
+            stop_server()
+            time.sleep(3)
+            start_server()
+
+            _run_safe('场景14', test_14_venue_closure_permission_control)
+            _run_safe('场景15', test_15_venue_closure_conflict_pass)
+            _run_safe('场景16', test_16_venue_closure_import_export)
+            _run_safe('场景17', test_17_venue_closure_cross_restart)
         finally:
             stop_server()
     finally:

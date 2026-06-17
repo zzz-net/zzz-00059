@@ -14,6 +14,7 @@
 - **排期导出**：按日期导出 CSV 排期表
 - **批量导入**：CSV 批量导入排期数据，支持预演、确认、取消和完整复核
 - **角色分层**：审批人和普通申请人看到不同层级的字段，审批侧明细不会泄露给申请人
+- **场地临时封场**：审批人可按场地录入封场时段、原因、恢复备注，控制是否影响已存在申请；新建、导入、预检、审批、撤销恢复全链路生效
 
 ### 关键校验规则
 1. **创建时**：时段必须在场地营业时间内
@@ -22,10 +23,15 @@
 4. **撤销取消时**：重新检查时段冲突和日配额
 5. **重复导入时**：同一 CSV 文件重复上传会被预演阶段检测到冲突
 6. **已取消批次重复上传**：同一文件名 + 同一操作人对应的已取消批次再次上传会被拦截，判为历史重复，不能重新建单
+7. **场地封场时（新建）**：申请时段命中任何 active 状态的场地封场一律拦截（不区分 affects_existing），返回明确封场原因和受影响的封场对象
+8. **场地封场时（导入）**：CSV 预演和正式导入的每条记录都会检查封场，命中归入 `venue_closed` 分类
+9. **场地封场时（审批）**：仅当封场 `affects_existing_applications=True` 时才拦截待审批的已存在申请
+10. **场地封场时（撤销恢复）**：仅当封场 `affects_existing_applications=True` 且目标状态为 CONFIRMED 时才拦截
+11. **场地封场时（预检）**：命中后 `expected_result='closure'`，返回封场对象和原因摘要
 
 ### 权限规则
-- **审批人**：可以审批通过/驳回、撤销取消、取消任意申请、上传/确认/取消导入批次、查看完整批次摘要和审批明细、导出批次复核 CSV
-- **普通申请人**：只能提交申请、取消自己的申请，查看自己的排期结果和必要状态，**不能**看到批次 ID、导入文件名、审批人、审批结论、失败分类等审批侧明细
+- **审批人**：可以审批通过/驳回、撤销取消、取消任意申请、上传/确认/取消导入批次、查看完整批次摘要和审批明细、导出批次复核 CSV；**同时可以创建/修改/撤销/删除场地封场配置**，查看封场的受影响申请列表和审计日志
+- **普通申请人**：只能提交申请、取消自己的申请，查看自己的排期结果和必要状态，**不能**看到批次 ID、导入文件名、审批人、审批结论、失败分类等审批侧明细；**只能看到自己的申请为什么被封场拦截（原因/时段），不能查看或修改封场配置**
 - 默认审批人名单：`张三`、`管理员`、`admin`、`Administrator`（可在 `app.py` 的 `APPROVERS` 中修改）
 
 ### 角色分层字段规则
@@ -34,10 +40,13 @@
 |------|-----------|-----------|
 | 批次列表 `/api/import` | 批次ID、文件名、导入人、确认人、错误分类、审批状态聚合等全部字段 | 仅状态、成功/失败/总数、创建/更新时间 |
 | 批次详情 `/api/import/{id}` | 全部字段 + 操作日志 + 关联申请日志 | 仅自己相关的记录，且不含 batch_id、error_category、conflict_with_application_id 等；application 子对象仅含 id/status/status_label |
-| 排期视图 `/api/schedule/{date}` | 全部已确认申请字段 | 仅自己名下的已确认申请，且不含审批人、审批结论、冲突摘要等 |
-| 排期导出 `/api/schedule/{date}/export` | 含审批人、审批意见、冲突摘要、审批结论、导入批次ID、导入文件名等18列 | 仅日期、场地、活动名称、申请人、开始时间、结束时间、参与人数、状态8列 |
+| 排期视图 `/api/schedule/{date}` | 全部已确认申请字段 + 顶层 `venue_closures` + 每个场地 `venue_closures`/`closure_affected_application_ids` + 每个申请 `has_venue_closure`/`venue_closure_reason`/`venue_closure_id`/`closure_affects_existing` | 仅自己名下的已确认申请 + 顶层 `venue_closures`（仅 reason/时段/状态）+ 自己申请的 `has_venue_closure`/`venue_closure_reason`，不含审批人、审批结论、冲突摘要、封场内部 ID 等 |
+| 排期导出 `/api/schedule/{date}/export` | 含审批人、审批意见、冲突摘要、审批结论、导入批次ID、导入文件名、**是否命中封场/封场ID/封场原因/封场时段** 共 22 列 | 仅日期、场地、活动名称、申请人、开始时间、结束时间、参与人数、状态、**是否命中封场/封场原因** 共 10 列 |
 | 申请列表 `/api/applications` | 全部字段 + 预检信息 | 不含审批人、审批结论、冲突摘要、审批意见、取消原因等 |
 | 我的排期 `/api/my-schedule` | 全部字段（审批人查自己） | 不含审批人、审批结论等审批侧明细 |
+| 封场列表 `/api/venue-closures` | 全部字段：reason/restore_note/affects_existing_applications/created_by/revoked_by/revoke_reason/audit_logs/affected_applications | 仅 id/venue_id/venue_name/起止日期时间/reason/status/status_label；不含 created_by/revoked_by/affects_existing/audit_logs |
+| 封场详情 `/api/venue-closures/{id}` | 全部字段 + affected_applications 列表 + audit_logs 操作日志 | 仅基本字段，无受影响申请和操作日志 |
+| 批次 error_breakdown | 含 `venue_closed` 计数器 | 无 error_breakdown 字段 |
 
 ## 本地启动
 

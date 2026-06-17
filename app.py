@@ -7,7 +7,8 @@ from flask import Flask, request, jsonify, render_template, Response, send_file
 
 from models import (db, Venue, Application, ApplicationStatus, StatusHistory, AuditLog,
                     ImportBatch, ImportBatchStatus, ImportRecord, ImportRecordStatus,
-                    ImportRecordErrorCategory, ERROR_CATEGORY_LABEL)
+                    ImportRecordErrorCategory, ERROR_CATEGORY_LABEL,
+                    VenueClosure, VenueClosureStatus)
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 
@@ -73,6 +74,45 @@ def _migrate_schema():
                 if c not in cols2:
                     col_type2 = 'INTEGER' if c == 'conflict_with_application_id' else 'VARCHAR(50)'
                     conn.execute(text(f"ALTER TABLE import_records ADD COLUMN {c} {col_type2} DEFAULT ''"))
+
+            rs3 = conn.execute(text("PRAGMA table_info(venue_closures)"))
+            cols3 = {row[1] for row in rs3.fetchall()}
+            if not cols3:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS venue_closures (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        venue_id INTEGER NOT NULL,
+                        closure_start_date DATE NOT NULL,
+                        closure_end_date DATE NOT NULL,
+                        closure_start_time TIME,
+                        closure_end_time TIME,
+                        reason TEXT DEFAULT '',
+                        restore_note TEXT DEFAULT '',
+                        affects_existing_applications BOOLEAN DEFAULT 1,
+                        created_by VARCHAR(100) DEFAULT '',
+                        created_at DATETIME,
+                        updated_at DATETIME,
+                        status VARCHAR(30) DEFAULT 'active',
+                        revoked_by VARCHAR(100) DEFAULT '',
+                        revoked_at DATETIME,
+                        revoke_reason TEXT DEFAULT '',
+                        FOREIGN KEY (venue_id) REFERENCES venues(id)
+                    )
+                """))
+            else:
+                for c in ('affects_existing_applications', 'status', 'revoked_by', 'revoked_at', 'revoke_reason', 'restore_note'):
+                    if c not in cols3:
+                        if c == 'affects_existing_applications':
+                            col_t = 'BOOLEAN DEFAULT 1'
+                        elif c in ('revoked_at',):
+                            col_t = 'DATETIME'
+                        elif c == 'status':
+                            col_t = "VARCHAR(30) DEFAULT 'active'"
+                        elif c in ('restore_note', 'revoke_reason'):
+                            col_t = 'TEXT DEFAULT \'\''
+                        else:
+                            col_t = 'VARCHAR(100) DEFAULT \'\''
+                        conn.execute(text(f"ALTER TABLE venue_closures ADD COLUMN {c} {col_t}"))
             conn.commit()
         finally:
             conn.close()
@@ -156,6 +196,17 @@ def validate_import_record(record, venues_by_name, daily_usage_cache=None):
             errors.append(
                 f'超出当日配额（已确认 {current_count} 场，配额 {venue.daily_quota} 场）')
             error_categories.append(ImportRecordErrorCategory.QUOTA_EXCEEDED)
+
+    if venue and record.apply_date and record.start_time and record.end_time and not errors:
+        closure = find_active_venue_closure(venue.id, record.apply_date, record.start_time, record.end_time)
+        if closure:
+            cs = closure.closure_start_time or time(0, 0)
+            ce = closure.closure_end_time or time(23, 59)
+            t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+            errors.append(
+                f'场地临时封场：{closure.reason or "场地维护"}（{t_range}），申请时段在封场范围内'
+            )
+            error_categories.append(ImportRecordErrorCategory.VENUE_CLOSED)
 
     primary_category = error_categories[0] if error_categories else ''
     return errors, venue, primary_category, conflict_application_id
@@ -453,6 +504,32 @@ def check_pending_conflict(venue_id, apply_date, start_t, end_t, exclude_app_id=
     return None
 
 
+def find_active_venue_closure(venue_id, apply_date, start_t, end_t):
+    closures = VenueClosure.query.filter(
+        VenueClosure.venue_id == venue_id,
+        VenueClosure.status == VenueClosureStatus.ACTIVE,
+        VenueClosure.closure_start_date <= apply_date,
+        VenueClosure.closure_end_date >= apply_date,
+    ).all()
+    for c in closures:
+        if c.covers_period(apply_date, start_t, end_t):
+            return c
+    return None
+
+
+def list_active_venue_closures(venue_id=None, apply_date=None):
+    query = VenueClosure.query.filter(VenueClosure.status == VenueClosureStatus.ACTIVE)
+    if venue_id:
+        query = query.filter(VenueClosure.venue_id == venue_id)
+    if apply_date:
+        query = query.filter(
+            VenueClosure.closure_start_date <= apply_date,
+            VenueClosure.closure_end_date >= apply_date,
+        )
+    return query.order_by(VenueClosure.closure_start_date.asc(),
+                          VenueClosure.id.asc()).all()
+
+
 def _app_summary_dict(app):
     return {
         'id': app.id,
@@ -521,16 +598,25 @@ def build_precheck(application):
     issues = []
     expected = 'pass'
 
+    closure = find_active_venue_closure(venue_id, apply_date, start_t, end_t)
+    if closure:
+        cs = closure.closure_start_time or time(0, 0)
+        ce = closure.closure_end_time or time(23, 59)
+        t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+        issues.append(f'场地临时封场：{closure.reason or "场地维护"}（{t_range}）')
+        expected = 'closure'
+
     if confirmed_conflicts:
         issues.append('存在已确认时段冲突')
-        expected = 'conflict'
+        if expected == 'pass':
+            expected = 'conflict'
     if pending_conflicts:
         issues.append('存在待审批重叠项')
         if expected == 'pass':
             expected = 'warning'
     if not quota_ok:
         issues.append('当日配额已用尽')
-        if expected not in ('conflict',):
+        if expected not in ('conflict', 'closure'):
             expected = 'quota_exceeded'
 
     if application.status not in (ApplicationStatus.PENDING_APPROVAL, ApplicationStatus.SUBMITTED):
@@ -538,6 +624,11 @@ def build_precheck(application):
         issues.append('当前申请状态不处于待审批')
 
     conflict_summary_parts = []
+    if closure:
+        cs = closure.closure_start_time or time(0, 0)
+        ce = closure.closure_end_time or time(23, 59)
+        t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+        conflict_summary_parts.append(f'封场拦截：{closure.reason or "场地维护"}（{t_range}）')
     if confirmed_conflicts:
         names = '、'.join('#%d「%s」' % (a.id, a.event_name) for a in confirmed_conflicts[:3])
         if len(confirmed_conflicts) > 3:
@@ -552,7 +643,7 @@ def build_precheck(application):
         conflict_summary_parts.append('配额已满(%d/%d)' % (confirmed_count, venue.daily_quota))
     conflict_summary = '；'.join(conflict_summary_parts)
 
-    return {
+    precheck_result = {
         'application_id': application.id,
         'venue_id': venue.id,
         'venue_name': venue.name,
@@ -572,6 +663,10 @@ def build_precheck(application):
         'expected_result': expected,
         'conflict_summary': conflict_summary,
     }
+    if closure:
+        precheck_result['venue_closure'] = closure.to_dict()
+        precheck_result['closure_affects_existing'] = closure.affects_existing_applications
+    return precheck_result
 
 
 @app.route('/')
@@ -773,6 +868,28 @@ def create_application():
     if not event_name:
         return jsonify({'error': '活动名称不能为空'}), 400
 
+    closure = find_active_venue_closure(venue_id, apply_date, start_t, end_t)
+    if closure:
+        cs = closure.closure_start_time or time(0, 0)
+        ce = closure.closure_end_time or time(23, 59)
+        t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+        closure_reason = closure.reason or '场地维护'
+        add_audit_log(data.get('created_by', applicant_name), 'application_denied_closure', 'application', None,
+                      f'新建申请被封场拦截：{venue.name} {apply_date.isoformat()} {start_t.strftime("%H:%M")}-{end_t.strftime("%H:%M")} 原因={closure_reason}',
+                      request.remote_addr)
+        return jsonify({
+            'error': f'场地临时封场：{closure_reason}（{t_range}），申请时段在封场范围内，无法提交',
+            'venue_closure': {
+                'closure_id': closure.id,
+                'venue_name': venue.name,
+                'closure_start_date': closure.closure_start_date.isoformat(),
+                'closure_end_date': closure.closure_end_date.isoformat(),
+                'closure_start_time': cs.strftime('%H:%M') if closure.closure_start_time else None,
+                'closure_end_time': ce.strftime('%H:%M') if closure.closure_end_time else None,
+                'reason': closure_reason,
+            }
+        }), 409
+
     app = Application(
         venue_id=venue_id,
         applicant_name=applicant_name,
@@ -904,6 +1021,21 @@ def approve_application(app_id):
                       '审批前正式校验配额 | %s' % conclusion, request.remote_addr)
         return jsonify({
             'error': f'超出当日配额（已确认 {current_count} 场，配额 {app.venue.daily_quota} 场）'
+        }), 409
+
+    closure = find_active_venue_closure(app.venue_id, app.apply_date, app.start_time, app.end_time)
+    if closure and closure.affects_existing_applications:
+        cs = closure.closure_start_time or time(0, 0)
+        ce = closure.closure_end_time or time(23, 59)
+        t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+        conclusion = '驳回-场地封场：%s（%s）' % (closure.reason or '场地维护', t_range)
+        app.approval_conclusion = conclusion
+        db.session.commit()
+        add_audit_log(operator, 'approve_closure_block', 'application', app.id,
+                      '审批前正式校验封场 | %s' % conclusion, request.remote_addr)
+        return jsonify({
+            'error': f'场地临时封场：{closure.reason or "场地维护"}（{t_range}），申请时段在封场范围内，无法审批通过',
+            'venue_closure': closure.to_dict(),
         }), 409
 
     from_status = app.status
@@ -1057,6 +1189,19 @@ def revoke_cancellation(app_id):
                 'error': f'撤销失败：超出当日配额（已确认 {current_count} 场，配额 {app.venue.daily_quota} 场）'
             }), 409
 
+        closure = find_active_venue_closure(app.venue_id, app.apply_date, app.start_time, app.end_time)
+        if closure and closure.affects_existing_applications:
+            cs = closure.closure_start_time or time(0, 0)
+            ce = closure.closure_end_time or time(23, 59)
+            t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+            add_audit_log(operator, 'revoke_closure_block', 'application', app.id,
+                          f'撤销取消恢复被封场拦截：{closure.reason or "场地维护"}（{t_range}）',
+                          request.remote_addr)
+            return jsonify({
+                'error': f'撤销失败：场地临时封场：{closure.reason or "场地维护"}（{t_range}），申请时段在封场范围内',
+                'venue_closure': closure.to_dict(),
+            }), 409
+
     from_status = app.status
     app.status = target_status
     app.previous_status = from_status
@@ -1085,6 +1230,12 @@ def get_schedule(date_str):
     viewer_role = 'approver' if is_approver(viewer) else 'applicant'
 
     venues = Venue.query.filter_by(is_active=True).order_by(Venue.id.asc()).all()
+
+    active_closures_by_venue = {}
+    all_closures = list_active_venue_closures(apply_date=d)
+    for c in all_closures:
+        active_closures_by_venue.setdefault(c.venue_id, []).append(c)
+
     result = []
     for v in venues:
         query = Application.query.filter(
@@ -1102,6 +1253,18 @@ def get_schedule(date_str):
             'daily_quota': v.daily_quota,
             'applications': []
         }
+        closures_for_venue = active_closures_by_venue.get(v.id, [])
+        if closures_for_venue:
+            venue_data['venue_closures'] = [c.to_dict(viewer_role=viewer_role) for c in closures_for_venue]
+            affected_app_ids = set()
+            for c in closures_for_venue:
+                cs = c.closure_start_time or time(0, 0)
+                ce = c.closure_end_time or time(23, 59)
+                for a in apps:
+                    if c.covers_period(d, a.start_time, a.end_time):
+                        affected_app_ids.add(a.id)
+            venue_data['closure_affected_application_ids'] = sorted(list(affected_app_ids))
+
         for a in apps:
             ad = a.to_dict()
             if viewer_role == 'applicant':
@@ -1112,10 +1275,26 @@ def get_schedule(date_str):
                     'last_precheck_at', 'last_precheck_by', 'previous_status',
                 }
                 ad = {k: v for k, v in ad.items() if k not in _SCHEDULE_APPLICANT_STRIP}
+            for c in closures_for_venue:
+                if c.covers_period(d, a.start_time, a.end_time):
+                    ad['has_venue_closure'] = True
+                    ad['venue_closure_reason'] = c.reason or '场地维护'
+                    if viewer_role == 'approver':
+                        ad['venue_closure_id'] = c.id
+                        ad['closure_affects_existing'] = c.affects_existing_applications
+                    break
             venue_data['applications'].append(ad)
         result.append(venue_data)
 
-    return jsonify({'date': d.isoformat(), 'venues': result})
+    all_closures_visible = []
+    for c in all_closures:
+        all_closures_visible.append(c.to_dict(viewer_role=viewer_role))
+
+    return jsonify({
+        'date': d.isoformat(),
+        'venues': result,
+        'venue_closures': all_closures_visible,
+    })
 
 
 STATUS_EXPORT_LABEL = {
@@ -1165,6 +1344,11 @@ def export_schedule(date_str):
 
     venues = Venue.query.filter_by(is_active=True).order_by(Venue.id.asc()).all()
 
+    active_closures_by_venue = {}
+    all_closures = list_active_venue_closures(apply_date=d)
+    for c in all_closures:
+        active_closures_by_venue.setdefault(c.venue_id, []).append(c)
+
     output = StringIO()
     writer = csv.writer(output)
 
@@ -1172,12 +1356,13 @@ def export_schedule(date_str):
         writer.writerow([
             '日期', '场地', '活动名称', '申请人', '开始时间', '结束时间',
             '参与人数', '状态', '审批人', '审批意见', '冲突摘要', '审批结论',
-            '导入批次ID', '导入文件名', 'CSV行号', '导入结果', '导入失败分类', '导入失败原因'
+            '导入批次ID', '导入文件名', 'CSV行号', '导入结果', '导入失败分类', '导入失败原因',
+            '是否命中封场', '封场ID', '封场原因', '封场时段'
         ])
     else:
         writer.writerow([
             '日期', '场地', '活动名称', '申请人', '开始时间', '结束时间',
-            '参与人数', '状态'
+            '参与人数', '状态', '是否命中封场', '封场原因'
         ])
 
     apps_query = Application.query.filter(Application.apply_date == d)
@@ -1206,6 +1391,22 @@ def export_schedule(date_str):
 
     for v, a in all_apps:
         batch_info = app_batch_map.get(a.id, {})
+        hit_closure = None
+        closures_for_venue = active_closures_by_venue.get(v.id, [])
+        for c in closures_for_venue:
+            if c.covers_period(d, a.start_time, a.end_time):
+                hit_closure = c
+                break
+        if hit_closure:
+            cs = hit_closure.closure_start_time or time(0, 0)
+            ce = hit_closure.closure_end_time or time(23, 59)
+            closure_time_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if hit_closure.closure_start_time else '全天'
+            closure_reason = hit_closure.reason or '场地维护'
+            closure_flag = '是'
+        else:
+            closure_flag = ''
+            closure_reason = ''
+            closure_time_range = ''
         if viewer_role == 'approver':
             writer.writerow([
                 d.isoformat(),
@@ -1226,6 +1427,10 @@ def export_schedule(date_str):
                 batch_info.get('import_status', '') or '',
                 ERROR_CATEGORY_LABEL.get(batch_info.get('error_category', ''), '') or '',
                 batch_info.get('error_message', '') or '',
+                closure_flag,
+                hit_closure.id if hit_closure else '',
+                closure_reason,
+                closure_time_range,
             ])
         else:
             writer.writerow([
@@ -1237,6 +1442,8 @@ def export_schedule(date_str):
                 a.end_time.strftime('%H:%M'),
                 a.participants,
                 STATUS_EXPORT_LABEL.get(a.status, a.status),
+                closure_flag,
+                closure_reason,
             ])
 
     csv_content = output.getvalue()
@@ -1244,7 +1451,7 @@ def export_schedule(date_str):
 
     export_detail = f'导出 {d.isoformat()} 排期表（{viewer_role}视角）'
     if viewer_role == 'approver':
-        export_detail += '（含冲突摘要、审批结论与批次摘要）'
+        export_detail += '（含冲突摘要、审批结论与批次摘要与封场标记）'
     if batch_id_filter:
         export_detail += f'，按批次#{batch_id_filter}筛选'
     add_audit_log(operator, 'export_schedule', 'schedule', None, export_detail, request.remote_addr)
@@ -1771,6 +1978,290 @@ def get_application_history(app_id):
     if not app:
         return jsonify({'error': '申请不存在'}), 404
     return jsonify([h.to_dict() for h in app.status_history])
+
+
+@app.route('/api/venue-closures', methods=['GET'])
+def list_venue_closures():
+    viewer = request.args.get('viewer', '').strip()
+    viewer_role = 'approver' if is_approver(viewer) else 'applicant'
+    venue_id = request.args.get('venue_id', type=int)
+    status_filter = request.args.get('status', '').strip()
+    apply_date = request.args.get('apply_date', '').strip()
+
+    query = VenueClosure.query
+    if venue_id:
+        query = query.filter(VenueClosure.venue_id == venue_id)
+    if status_filter:
+        query = query.filter(VenueClosure.status == status_filter)
+    if apply_date:
+        d = parse_date_str(apply_date)
+        query = query.filter(
+            VenueClosure.closure_start_date <= d,
+            VenueClosure.closure_end_date >= d,
+        )
+    closures = query.order_by(VenueClosure.closure_start_date.desc(),
+                              VenueClosure.id.desc()).all()
+    return jsonify([c.to_dict(viewer_role=viewer_role) for c in closures])
+
+
+@app.route('/api/venue-closures/<int:closure_id>', methods=['GET'])
+def get_venue_closure(closure_id):
+    viewer = request.args.get('viewer', '').strip()
+    viewer_role = 'approver' if is_approver(viewer) else 'applicant'
+    closure = VenueClosure.query.get(closure_id)
+    if not closure:
+        return jsonify({'error': '封场记录不存在'}), 404
+    result = closure.to_dict(viewer_role=viewer_role)
+    if viewer_role == 'approver':
+        affected_apps = []
+        if closure.status == VenueClosureStatus.ACTIVE:
+            apps = Application.query.filter(
+                Application.venue_id == closure.venue_id,
+                Application.apply_date >= closure.closure_start_date,
+                Application.apply_date <= closure.closure_end_date,
+                Application.status.in_([ApplicationStatus.CONFIRMED,
+                                        ApplicationStatus.PENDING_APPROVAL,
+                                        ApplicationStatus.SUBMITTED]),
+            ).order_by(Application.apply_date.asc(),
+                       Application.start_time.asc()).all()
+            cs = closure.closure_start_time or time(0, 0)
+            ce = closure.closure_end_time or time(23, 59)
+            for a in apps:
+                if closure.covers_period(a.apply_date, a.start_time, a.end_time):
+                    affected_apps.append(_app_summary_dict(a))
+        result['affected_applications'] = affected_apps
+        related_logs = AuditLog.query.filter(
+            AuditLog.target_type == 'venue_closure',
+            AuditLog.target_id == closure_id,
+        ).order_by(AuditLog.id.desc()).all()
+        result['audit_logs'] = [l.to_dict() for l in related_logs]
+    return jsonify(result)
+
+
+@app.route('/api/venue-closures', methods=['POST'])
+def create_venue_closure():
+    data = request.get_json() or {}
+    operator = data.get('operator', '').strip()
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'closure_create_denied', 'venue_closure', None,
+                      '无权限创建封场记录被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
+    venue_id = data.get('venue_id')
+    venue = Venue.query.get(venue_id)
+    if not venue:
+        return jsonify({'error': '场地不存在'}), 404
+
+    closure_start_date = parse_date_str(data.get('closure_start_date'))
+    closure_end_date = parse_date_str(data.get('closure_end_date'))
+    if not closure_start_date or not closure_end_date:
+        return jsonify({'error': '封场起止日期不能为空'}), 400
+    if closure_start_date > closure_end_date:
+        return jsonify({'error': '封场开始日期不能晚于结束日期'}), 400
+
+    closure_start_time_str = data.get('closure_start_time')
+    closure_end_time_str = data.get('closure_end_time')
+    closure_start_time = parse_time_str(closure_start_time_str) if closure_start_time_str else None
+    closure_end_time = parse_time_str(closure_end_time_str) if closure_end_time_str else None
+    if bool(closure_start_time) != bool(closure_end_time):
+        return jsonify({'error': '封场时段需同时提供开始和结束时间，或都为空表示全天'}), 400
+    if closure_start_time and closure_end_time and closure_start_time >= closure_end_time:
+        return jsonify({'error': '封场开始时间必须早于结束时间'}), 400
+
+    reason = data.get('reason', '').strip()
+    restore_note = data.get('restore_note', '').strip()
+    affects_existing = bool(data.get('affects_existing_applications', True))
+
+    closure = VenueClosure(
+        venue_id=venue_id,
+        closure_start_date=closure_start_date,
+        closure_end_date=closure_end_date,
+        closure_start_time=closure_start_time,
+        closure_end_time=closure_end_time,
+        reason=reason,
+        restore_note=restore_note,
+        affects_existing_applications=affects_existing,
+        created_by=operator,
+        status=VenueClosureStatus.ACTIVE,
+    )
+    db.session.add(closure)
+    db.session.flush()
+
+    cs = closure_start_time or time(0, 0)
+    ce = closure_end_time or time(23, 59)
+    t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure_start_time else '全天'
+    affected_count = 0
+    if affects_existing:
+        existing = Application.query.filter(
+            Application.venue_id == venue_id,
+            Application.apply_date >= closure_start_date,
+            Application.apply_date <= closure_end_date,
+            Application.status.in_([ApplicationStatus.CONFIRMED,
+                                    ApplicationStatus.PENDING_APPROVAL,
+                                    ApplicationStatus.SUBMITTED]),
+        ).all()
+        for a in existing:
+            if closure.covers_period(a.apply_date, a.start_time, a.end_time):
+                affected_count += 1
+
+    db.session.commit()
+
+    audit_detail = '创建封场：场地=%s 日期=%s~%s 时段=%s 影响现有=%s 影响申请数=%d 原因=%s' % (
+        venue.name, closure_start_date.isoformat(), closure_end_date.isoformat(),
+        t_range, affects_existing, affected_count, reason or '场地维护'
+    )
+    add_audit_log(operator, 'create_venue_closure', 'venue_closure', closure.id,
+                  audit_detail, request.remote_addr)
+
+    result = closure.to_dict()
+    result['affected_application_count'] = affected_count
+    return jsonify(result), 201
+
+
+@app.route('/api/venue-closures/<int:closure_id>', methods=['PUT'])
+def update_venue_closure(closure_id):
+    data = request.get_json() or {}
+    operator = data.get('operator', '').strip()
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'closure_update_denied', 'venue_closure', closure_id,
+                      '无权限更新封场记录被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
+    closure = VenueClosure.query.get(closure_id)
+    if not closure:
+        return jsonify({'error': '封场记录不存在'}), 404
+    if closure.status != VenueClosureStatus.ACTIVE:
+        return jsonify({'error': '仅生效中的封场可以修改'}), 400
+
+    changes = []
+    if 'closure_start_date' in data:
+        new_val = parse_date_str(data['closure_start_date'])
+        if new_val and new_val != closure.closure_start_date:
+            changes.append(f'开始日期: {closure.closure_start_date.isoformat()} -> {new_val.isoformat()}')
+            closure.closure_start_date = new_val
+    if 'closure_end_date' in data:
+        new_val = parse_date_str(data['closure_end_date'])
+        if new_val and new_val != closure.closure_end_date:
+            changes.append(f'结束日期: {closure.closure_end_date.isoformat()} -> {new_val.isoformat()}')
+            closure.closure_end_date = new_val
+    if closure.closure_start_date > closure.closure_end_date:
+        db.session.rollback()
+        return jsonify({'error': '封场开始日期不能晚于结束日期'}), 400
+
+    if 'closure_start_time' in data or 'closure_end_time' in data:
+        new_s = parse_time_str(data['closure_start_time']) if data.get('closure_start_time') else None
+        new_e = parse_time_str(data['closure_end_time']) if data.get('closure_end_time') else None
+        if bool(new_s) != bool(new_e):
+            db.session.rollback()
+            return jsonify({'error': '封场时段需同时提供开始和结束时间，或都为空表示全天'}), 400
+        if new_s and new_e and new_s >= new_e:
+            db.session.rollback()
+            return jsonify({'error': '封场开始时间必须早于结束时间'}), 400
+        old_s = closure.closure_start_time
+        old_e = closure.closure_end_time
+        if new_s != old_s or new_e != old_e:
+            old_tr = (f'{old_s.strftime("%H:%M")}-{old_e.strftime("%H:%M")}'
+                      if old_s else '全天')
+            new_tr = f'{new_s.strftime("%H:%M")}-{new_e.strftime("%H:%M")}' if new_s else '全天'
+            changes.append(f'时段: {old_tr} -> {new_tr}')
+            closure.closure_start_time = new_s
+            closure.closure_end_time = new_e
+
+    if 'reason' in data:
+        new_val = data['reason'].strip()
+        if new_val != closure.reason:
+            changes.append(f'原因变更')
+            closure.reason = new_val
+    if 'restore_note' in data:
+        new_val = data['restore_note'].strip()
+        if new_val != closure.restore_note:
+            changes.append(f'恢复备注变更')
+            closure.restore_note = new_val
+    if 'affects_existing_applications' in data:
+        new_val = bool(data['affects_existing_applications'])
+        if new_val != closure.affects_existing_applications:
+            changes.append(f'影响现有申请: {closure.affects_existing_applications} -> {new_val}')
+            closure.affects_existing_applications = new_val
+
+    if not changes:
+        return jsonify(closure.to_dict())
+
+    db.session.commit()
+    add_audit_log(operator, 'update_venue_closure', 'venue_closure', closure_id,
+                  f'更新封场：{"；".join(changes)}', request.remote_addr)
+    return jsonify(closure.to_dict())
+
+
+@app.route('/api/venue-closures/<int:closure_id>/revoke', methods=['POST'])
+def revoke_venue_closure(closure_id):
+    data = request.get_json() or {}
+    operator = data.get('operator', '').strip()
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'closure_revoke_denied', 'venue_closure', closure_id,
+                      '无权限撤销封场记录被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
+    closure = VenueClosure.query.get(closure_id)
+    if not closure:
+        return jsonify({'error': '封场记录不存在'}), 404
+    if closure.status != VenueClosureStatus.ACTIVE:
+        return jsonify({'error': '仅生效中的封场可以撤销'}), 400
+
+    closure.status = VenueClosureStatus.REVOKED
+    closure.revoked_by = operator
+    closure.revoked_at = datetime.utcnow()
+    closure.revoke_reason = data.get('revoke_reason', '').strip()
+    db.session.commit()
+
+    cs = closure.closure_start_time or time(0, 0)
+    ce = closure.closure_end_time or time(23, 59)
+    t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+    audit_detail = '撤销封场 #%d：场地=%s 日期=%s~%s 时段=%s 原因=%s' % (
+        closure_id, closure.venue.name if closure.venue else '',
+        closure.closure_start_date.isoformat(), closure.closure_end_date.isoformat(),
+        t_range, closure.revoke_reason or '提前恢复'
+    )
+    add_audit_log(operator, 'revoke_venue_closure', 'venue_closure', closure_id,
+                  audit_detail, request.remote_addr)
+    return jsonify(closure.to_dict())
+
+
+@app.route('/api/venue-closures/<int:closure_id>/delete', methods=['POST'])
+@app.route('/api/venue-closures/<int:closure_id>', methods=['DELETE'])
+def delete_venue_closure(closure_id):
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        operator = data.get('operator', '').strip()
+    else:
+        operator = request.args.get('operator', '').strip()
+    ok, err_msg = require_approver(operator)
+    if not ok:
+        add_audit_log(operator, 'closure_delete_denied', 'venue_closure', closure_id,
+                      '无权限删除封场记录被拒绝', request.remote_addr)
+        return jsonify({'error': err_msg}), 403
+
+    closure = VenueClosure.query.get(closure_id)
+    if not closure:
+        return jsonify({'error': '封场记录不存在'}), 404
+
+    cs = closure.closure_start_time or time(0, 0)
+    ce = closure.closure_end_time or time(23, 59)
+    t_range = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}' if closure.closure_start_time else '全天'
+    audit_detail = '删除封场 #%d：场地=%s 日期=%s~%s 时段=%s 状态=%s' % (
+        closure_id, closure.venue.name if closure.venue else '',
+        closure.closure_start_date.isoformat(), closure.closure_end_date.isoformat(),
+        t_range, closure.status
+    )
+
+    db.session.delete(closure)
+    db.session.commit()
+
+    add_audit_log(operator, 'delete_venue_closure', 'venue_closure', closure_id,
+                  audit_detail, request.remote_addr)
+    return jsonify({'message': '封场记录已删除'})
 
 
 def init_seed_data():
